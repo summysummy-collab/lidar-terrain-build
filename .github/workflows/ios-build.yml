@@ -1,0 +1,109 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Sources/**"
+      - "Resources/**"
+      - "project.yml"
+      - ".github/workflows/ios-build.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Generate AppIcon PNGs
+        run: |
+          python3 - <<'PY'
+          import os, struct, zlib, binascii
+          icondir = os.path.join('Resources', 'Assets.xcassets', 'AppIcon.appiconset')
+          os.makedirs(icondir, exist_ok=True)
+          specs = {'icon-20@2x.png': 40, 'icon-20@3x.png': 60, 'icon-29@2x.png': 58,
+                   'icon-29@3x.png': 87, 'icon-40@2x.png': 80, 'icon-40@3x.png': 120,
+                   'icon-60@2x.png': 120, 'icon-60@3x.png': 180, 'icon-1024.png': 1024}
+
+          def chunk(t, v):
+              return struct.pack('>I', len(v)) + t + v + struct.pack('>I', binascii.crc32(t + v) & 0xffffffff)
+
+          for name, n in specs.items():
+              p = bytearray(n * n * 3)
+              for y in range(n):
+                  for x in range(n):
+                      dx = (x - n / 2) / (n * .38); dy = (y - n / 2) / (n * .38)
+                      c = (9, 18, 30)
+                      if dx * dx + dy * dy < 1:
+                          c = (17, 82, 145)
+                      if .88 < dx * dx + dy * dy < 1 and abs(dx) < 1:
+                          c = (78, 190, 255)
+                      for i, h in enumerate((.18, .30, .44)):
+                          if n * (.26 + i * .18) <= x <= n * (.44 + i * .18) and n * (.65 - h) <= y <= n * .65:
+                              c = (255, 255, 255)
+                      if n * .18 <= x <= n * .82 and abs(y - n * .76) < max(1, n // 30):
+                          c = (70, 230, 170)
+                      k = (y * n + x) * 3
+                      p[k:k + 3] = bytes(c)
+              raw = b''.join(b'\x00' + p[y * n * 3:(y + 1) * n * 3] for y in range(n))
+              data = (b'\x89PNG\r\n\x1a\n'
+                      + chunk(b'IHDR', struct.pack('>IIBBBBB', n, n, 8, 2, 0, 0, 0))
+                      + chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
+              open(os.path.join(icondir, name), 'wb').write(data)
+              print('generated', name, n)
+          PY
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate --spec project.yml
+
+      - name: Build without code signing
+        run: |
+          xcodebuild \
+            -project LidarTerrain.xcodeproj \
+            -scheme LidarTerrain \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/LidarTerrain.app"
+          test -d "$APP_PATH"
+          test -f "$APP_PATH/LidarTerrain"
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/package/Payload/"
+          cd "$RUNNER_TEMP/package"
+          zip -qry "$GITHUB_WORKSPACE/LidarTerrain-unsigned.ipa" Payload
+          unzip -t "$GITHUB_WORKSPACE/LidarTerrain-unsigned.ipa"
+
+      - name: Commit IPA back to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p dist
+          cp "$GITHUB_WORKSPACE/LidarTerrain-unsigned.ipa" dist/LidarTerrain-unsigned.ipa
+          git add dist/LidarTerrain-unsigned.ipa
+          git commit -m "Build unsigned IPA"
+          git push
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LidarTerrain-unsigned-ipa
+          path: LidarTerrain-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
