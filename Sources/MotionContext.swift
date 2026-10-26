@@ -72,7 +72,7 @@ final class MotionContext {
     }
 
     func stop() {
-        if altimeter.isRelativeAltitudeAvailable() {
+        if CMAltimeter.isRelativeAltitudeAvailable() {
             altimeter.stopRelativeAltitudeUpdates()
         }
         if motionManager.isDeviceMotionActive {
