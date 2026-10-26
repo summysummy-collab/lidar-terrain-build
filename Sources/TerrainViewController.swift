@@ -6,6 +6,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
     private let arView = ARSCNView()
     private let analyzer = DepthTerrainAnalyzer()
     private let speech = TerrainSpeech()
+    private let motion = MotionContext()
 
     private let statusLabel = UILabel()
     private let terrainLabel = UILabel()
@@ -38,6 +39,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
     private var lastAnalysisTimestamp: TimeInterval = 0
     private var lastAnnouncedKind: TerrainKind = .unknown
     private var lastAnnouncementAt = Date.distantPast
+    private var lastAnnouncedDistance: Float = 0
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
@@ -266,12 +268,14 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         } else {
             configuration.frameSemantics = .sceneDepth
         }
+        motion.start()
         analysisQueue.sync {
             analyzer.reset()
             lastAnalysisTimestamp = 0
         }
         lastAnnouncedKind = .unknown
         lastAnnouncementAt = .distantPast
+        lastAnnouncedDistance = 0
         arView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         running = true
         UIApplication.shared.isIdleTimerDisabled = true
@@ -284,6 +288,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
     private func stopSession() {
         running = false
         arView.session.pause()
+        motion.stop()
         analysisQueue.sync {
             analyzer.reset()
             lastAnalysisTimestamp = 0
@@ -303,8 +308,12 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
                   frame.timestamp - self.lastAnalysisTimestamp >= 0.10 else { return }
             self.lastAnalysisTimestamp = frame.timestamp
             let displayTransform = frame.displayTransform(for: .portrait, viewportSize: self.viewportSize)
-            let result = self.analyzer.analyze(frame: frame, displayTransform: displayTransform)
-                ?? self.analyzer.unavailable("连续深度帧不可用，请检查镜头遮挡并缓慢移动")
+            let snapshot = self.motion.snapshot()
+            let result = self.analyzer.analyze(
+                frame: frame,
+                displayTransform: displayTransform,
+                motion: snapshot
+            ) ?? self.analyzer.unavailable("连续深度帧不可用，请检查镜头遮挡并缓慢移动")
             var overlay: UIImage?
             if self.overlayEnabled {
                 self.overlayTick += 1
@@ -419,15 +428,22 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             detail += " · 中位距离 \(String(format: "%.1f", distance))m"
         }
         updateTerrain(result.kind, confidence: result.confidence, detail: detail)
-        statusLabel.text = "v4 · LiDAR + 摄像头融合 · 障碍检测 · 9–10 次/秒"
+        statusLabel.text = "v5 · LiDAR + 运动融合 · 障碍 1.5m 内 · 9–10 次/秒"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
         let hazard = result.kind == .dropOff || result.kind == .obstacle
+        let obstacle = result.kind == .obstacle ? (result.distance ?? 0) : 0
         let changed = result.kind != lastAnnouncedKind
-        let urgentRepeat = hazard && now.timeIntervalSince(lastAnnouncementAt) >= (result.kind == .dropOff ? 6 : 4)
+        // Walking towards an obstacle changes the picture: re-announce as the
+        // measured distance drops instead of repeating one stale number.
+        let closingIn = result.kind == .obstacle
+            && lastAnnouncedKind == .obstacle
+            && abs(obstacle - lastAnnouncedDistance) >= 0.4
+        let repeatInterval: TimeInterval = result.kind == .dropOff ? 6 : 2
+        let urgentRepeat = hazard && now.timeIntervalSince(lastAnnouncementAt) >= repeatInterval
         let periodicReminder = result.kind != .flat && !hazard && now.timeIntervalSince(lastAnnouncementAt) >= 15
-        if changed || urgentRepeat || periodicReminder {
+        if changed || closingIn || urgentRepeat || periodicReminder {
             if voiceSwitch.isOn {
                 speech.speak(result.announcement, urgent: hazard)
             }
@@ -435,6 +451,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
                 UINotificationFeedbackGenerator().notificationOccurred(.warning)
             }
             lastAnnouncedKind = result.kind
+            lastAnnouncedDistance = obstacle
             lastAnnouncementAt = now
         }
     }
@@ -457,7 +474,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             guard let self = self, self.running else { return }
             switch camera.trackingState {
             case .normal:
-                self.statusLabel.text = "LiDAR 本机实时分析 · 跟踪正常"
+                self.statusLabel.text = "v5 · LiDAR + 运动融合 · 跟踪正常"
             case .notAvailable:
                 self.statusLabel.text = "空间跟踪不可用"
             case .limited:

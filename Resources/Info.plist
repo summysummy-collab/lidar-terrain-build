@@ -24,6 +24,8 @@
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>使用后置摄像头和激光雷达测量前方地面、台阶与深度断层。</string>
+    <key>NSMotionUsageDescription</key>
+    <string>使用陀螺仪、加速度计和气压计判断正在上坡还是下坡、上楼还是下楼。</string>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
         <string>arm64</string>

@@ -30,8 +30,8 @@ struct TerrainResult {
         case .stairsDown: return "前方下楼梯，注意台阶"
         case .obstacle:
             guard let distance = distance else { return "注意，前方有障碍" }
-            let rounded = min(3.0, max(0.5, (distance * 2).rounded() / 2))
-            return "注意，前方约 \(String(format: "%.1f", rounded)) 米有障碍"
+            let rounded = min(1.5, max(0.3, distance))
+            return "注意，正前方 \(String(format: "%.1f", rounded)) 米有障碍，请停下"
         case .dropOff: return "注意，前方深度断层，请停止前行"
         }
     }
@@ -68,6 +68,27 @@ final class DepthTerrainAnalyzer {
     private var stairDirection: Float = 0
     private var reversalVotes = 0
 
+    // MARK: - Fused motion (accelerometer + gyroscope + barometer)
+
+    private struct MotionSample {
+        let time: TimeInterval
+        let horizontal: SIMD2<Float>
+        let altitude: Double
+    }
+
+    private var motionTrail: [MotionSample] = []
+    /// Barometer slope in tan form (rise / run), smoothed.
+    private var motionSlope: Float = 0
+    private var motionSlopeValid = false
+    private var motionSlopeUpdatedAt: TimeInterval = -1
+    private var motionSlopeStreak = 0
+    /// While non-zero, the phone's own vertical travel overrides the sign the
+    /// depth profile suggests. Cleared when the two agree again.
+    private var motionOverrideSign: Float = 0
+    private var motionOverrideUntil: TimeInterval = 0
+    private var motionConflictFrames = 0
+    private var motionNote = "运动 待采集"
+
     private var onStairs: Bool {
         lastStableKind == .stairsUp || lastStableKind == .stairsDown
     }
@@ -83,13 +104,27 @@ final class DepthTerrainAnalyzer {
         obstacleConfirmed = false
         stairDirection = 0
         reversalVotes = 0
+        motionTrail.removeAll()
+        motionSlope = 0
+        motionSlopeValid = false
+        motionSlopeUpdatedAt = -1
+        motionSlopeStreak = 0
+        motionOverrideSign = 0
+        motionOverrideUntil = 0
+        motionConflictFrames = 0
+        motionNote = "运动 待采集"
     }
 
     func unavailable(_ message: String) -> TerrainResult {
         stabilize(TerrainResult(kind: .unknown, confidence: 0.1, debug: message, distance: nil))
     }
 
-    func analyze(frame: ARFrame, displayTransform: CGAffineTransform) -> TerrainResult? {
+    func analyze(
+        frame: ARFrame,
+        displayTransform: CGAffineTransform,
+        motion: MotionSnapshot = .unavailable
+    ) -> TerrainResult? {
+        updateMotion(frame: frame, motion: motion)
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
         let depthMap = depthData.depthMap
         guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32 else {
@@ -205,7 +240,7 @@ final class DepthTerrainAnalyzer {
             obstacleStreak += 1
             obstacleDistance = report.distance
             obstacleDetail = "高差 \(String(format: "%.2f", report.heightSpan))m · 支撑 \(report.support) 点"
-            obstacleHold = 5
+            obstacleHold = 4
             if obstacleStreak >= 2 { obstacleConfirmed = true }
         } else {
             obstacleStreak = 0
@@ -216,12 +251,12 @@ final class DepthTerrainAnalyzer {
                 obstacleConfirmed = false
             }
         }
-        if obstacleConfirmed, let obstacle = obstacleDistance {
+        if obstacleConfirmed, let obstacle = obstacleDistance, obstacle <= 1.5 {
             degradedFrames = 0
             return TerrainResult(
                 kind: .obstacle,
-                confidence: min(0.93, 0.60 + (2.8 - min(2.8, obstacle)) * 0.11),
-                debug: "竖直面障碍 \(String(format: "%.1f", obstacle))m · \(obstacleDetail)",
+                confidence: min(0.95, 0.62 + (1.5 - min(1.5, obstacle)) * 0.18),
+                debug: "1.5m 内竖直面障碍 \(String(format: "%.1f", obstacle))m · \(obstacleDetail)",
                 distance: obstacle
             )
         }
@@ -345,16 +380,18 @@ final class DepthTerrainAnalyzer {
             }
         }
 
-        let isStairRaw = raw?.kind == .stairsUp || raw?.kind == .stairsDown
+        let fused = fuseMotion(raw: raw, timestamp: frame.timestamp, distance: distance)
+
+        let isStairRaw = fused?.kind == .stairsUp || fused?.kind == .stairsDown
         if !isStairRaw && !onStairs {
             stairDirection = 0
             reversalVotes = 0
         }
-        guard let raw = raw else {
-            return held("剖面混杂，暂无可判定的路面结构", confidence: 0.30, distance: distance)
+        guard let fused = fused else {
+            return held("剖面混杂，暂无可判定的路面结构 · " + motionNote, confidence: 0.30, distance: distance)
         }
         degradedFrames = 0
-        return stabilize(raw)
+        return stabilize(fused)
     }
 
     /// Keeps the previous verdict for a short grace period instead of
@@ -379,6 +416,221 @@ final class DepthTerrainAnalyzer {
         let intercept: Float
         let residual: Float
         let bins: [Bin]
+    }
+
+    // MARK: - Fused motion
+
+    /// Turns the barometer into a slope that does not care where the camera
+    /// points: relative altitude divided by the horizontal distance ARKit says
+    /// the phone actually travelled.
+    ///
+    /// This is the fix for "下楼梯被识别成上楼梯". A wall, a door or a stairwell
+    /// at the far end of a flight can tilt the depth profile, but it cannot
+    /// lift the phone. If the phone is going down, the barometer says so.
+    private func updateMotion(frame: ARFrame, motion: MotionSnapshot) {
+        let now = frame.timestamp
+        let column = frame.camera.transform.columns.3
+        let horizontal = SIMD2<Float>(column.x, column.z)
+
+        while let first = motionTrail.first, now - first.time > 2.9 {
+            motionTrail.removeFirst()
+        }
+
+        guard let altitude = motion.altitude, motion.altitudeSampleCount >= 3 else {
+            if now - motionSlopeUpdatedAt > 1.0 {
+                motionSlopeValid = false
+                motionSlopeStreak = 0
+                motionNote = "运动 气压计不可用"
+            }
+            return
+        }
+
+        if let last = motionTrail.last {
+            if now - last.time >= 0.08 {
+                motionTrail.append(MotionSample(time: now, horizontal: horizontal, altitude: altitude))
+            }
+        } else {
+            motionTrail.append(MotionSample(time: now, horizontal: horizontal, altitude: altitude))
+        }
+
+        guard let first = motionTrail.first, let last = motionTrail.last else { return }
+        let span = last.time - first.time
+
+        // Estimate travel by projecting hand positions on the dominant walking
+        // axis, then fit altitude against that projection. Using only the two
+        // endpoints would make the natural sway of a hand-held phone fake a
+        // short (or zero) distance and destroy the slope.
+        var mean = SIMD2<Float>(repeating: 0)
+        for sample in motionTrail { mean += sample.horizontal }
+        mean /= Float(motionTrail.count)
+
+        var sxx: Float = 0
+        var sxy: Float = 0
+        var syy: Float = 0
+        for sample in motionTrail {
+            let delta = sample.horizontal - mean
+            sxx += delta.x * delta.x
+            sxy += delta.x * delta.y
+            syy += delta.y * delta.y
+        }
+        let theta = 0.5 * atan2(2 * sxy, sxx - syy)
+        let axis = SIMD2<Float>(cos(theta), sin(theta))
+
+        var minProjection = Float.greatestFiniteMagnitude
+        var maxProjection = -Float.greatestFiniteMagnitude
+        var sumS: Float = 0
+        var sumH: Float = 0
+        var sumSS: Float = 0
+        var sumSH: Float = 0
+        for sample in motionTrail {
+            let projection = simd_dot(sample.horizontal - mean, axis)
+            let height = Float(sample.altitude)
+            minProjection = min(minProjection, projection)
+            maxProjection = max(maxProjection, projection)
+            sumS += projection
+            sumH += height
+            sumSS += projection * projection
+            sumSH += projection * height
+        }
+        let travelled = maxProjection - minProjection
+        let count = Float(motionTrail.count)
+        let denominator = count * sumSS - sumS * sumS
+        let fitted = denominator > 1e-4 ? (count * sumSH - sumS * sumH) / denominator : nil
+
+        // Too short a window, standing still, or an implausible jump (tracking
+        // reset): no verdict this frame, and the previous one expires quickly.
+        if span >= 1.7, travelled >= 0.35, motionTrail.count >= 8,
+           let slope = fitted, abs(slope) <= 1.8 {
+            motionSlope = motionSlopeValid ? motionSlope * 0.5 + slope * 0.5 : slope
+            motionSlopeValid = true
+            motionSlopeUpdatedAt = now
+            motionSlopeStreak = min(motionSlopeStreak + 1, 60)
+        } else if now - motionSlopeUpdatedAt > 1.0 {
+            motionSlopeValid = false
+            motionSlopeStreak = 0
+            motionSlope *= 0.6
+        }
+
+        if motionSlopeValid {
+            let degrees = atan(motionSlope) * 180.0 / .pi
+            let rising = motionSlope > 0.03 ? "上行" : (motionSlope < -0.03 ? "下行" : "近水平")
+            motionNote = String(
+                format: "运动 %@ %+.0f° · 步频 %.1f",
+                rising, degrees, motion.stepRate
+            )
+        }
+    }
+
+    private func directionKind(from candidate: TerrainResult?, sign: Float) -> TerrainKind {
+        let isStair = candidate?.kind == .stairsUp || candidate?.kind == .stairsDown
+        if isStair { return sign > 0 ? .stairsUp : .stairsDown }
+        return sign > 0 ? .uphill : .downhill
+    }
+
+    /// Second opinion from the phone's own vertical travel.
+    ///
+    /// The barometer cannot tell stairs from a ramp, so it never changes the
+    /// *kind* of the surface it only overrules the *direction*, and it can turn
+    /// a blind "flat" into a slope. A correction is latched so the two signals
+    /// cannot flip-flop every few frames.
+    private func fuseMotion(
+        raw: TerrainResult?,
+        timestamp: TimeInterval,
+        distance: Float?
+    ) -> TerrainResult? {
+        let degrees = atan(motionSlope) * 180.0 / .pi
+        let strength = abs(degrees)
+        let sign: Float = motionSlope > 0 ? 1 : (motionSlope < 0 ? -1 : 0)
+        let usable = motionSlopeValid && motionSlopeStreak >= 3 && strength >= 7.0 && sign != 0
+
+        guard usable else {
+            if timestamp > motionOverrideUntil { motionOverrideSign = 0 }
+            motionConflictFrames = max(0, motionConflictFrames - 1)
+            return raw
+        }
+
+        // A latched correction keeps winning while the barometer still agrees,
+        // so a stubborn depth profile cannot pull the verdict back and forth.
+        if motionOverrideSign == sign && timestamp <= motionOverrideUntil {
+            stairDirection = sign
+            reversalVotes = 0
+            let base = raw
+            return TerrainResult(
+                kind: directionKind(from: base, sign: sign),
+                confidence: max(0.52, min(0.78, base?.confidence ?? 0.52)),
+                debug: (base?.debug ?? "视觉剖面无结论") + " · 运动主导 \(Int(strength))°",
+                distance: base?.distance ?? distance
+            )
+        }
+
+        if let candidate = raw {
+            let visualSign: Float
+            switch candidate.kind {
+            case .stairsUp, .uphill: visualSign = 1
+            case .stairsDown, .downhill: visualSign = -1
+            case .flat: visualSign = 0
+            default: return candidate
+            }
+
+            if visualSign == sign {
+                motionConflictFrames = 0
+                motionOverrideSign = 0
+                return TerrainResult(
+                    kind: candidate.kind,
+                    confidence: min(0.95, candidate.confidence + 0.06),
+                    debug: candidate.debug + " · " + motionNote + " 一致",
+                    distance: candidate.distance
+                )
+            }
+
+            if visualSign == 0 {
+                // Flat profile, yet the phone keeps climbing or descending.
+                if motionSlopeStreak >= 8 {
+                    motionOverrideSign = sign
+                    motionOverrideUntil = timestamp + 5.0
+                    return TerrainResult(
+                        kind: directionKind(from: candidate, sign: sign),
+                        confidence: 0.55,
+                        debug: "剖面偏平但高度持续变化 · " + motionNote,
+                        distance: candidate.distance ?? distance
+                    )
+                }
+                return candidate
+            }
+
+            // Direct conflict. Keep the geometry verdict for a moment, but if
+            // the barometer keeps insisting, it wins: it is measuring the
+            // actual body movement, not a wall 4 m away.
+            motionConflictFrames += 1
+            if motionConflictFrames >= 8 {
+                motionConflictFrames = 0
+                motionOverrideSign = sign
+                motionOverrideUntil = timestamp + 5.0
+                stairDirection = sign
+                reversalVotes = 0
+                return TerrainResult(
+                    kind: directionKind(from: candidate, sign: sign),
+                    confidence: max(0.55, min(0.80, candidate.confidence - 0.05)),
+                    debug: candidate.debug + " · 运动纠正 \(Int(strength))°（原判 \(candidate.kind.rawValue)）",
+                    distance: candidate.distance
+                )
+            }
+            return candidate
+        }
+
+        // Vision produced nothing at all. A sustained slope is still worth
+        // saying out loud instead of leaving the user at "路况待确认".
+        if motionSlopeStreak >= 8 {
+            motionOverrideSign = sign
+            motionOverrideUntil = timestamp + 4.0
+            return TerrainResult(
+                kind: directionKind(from: nil, sign: sign),
+                confidence: 0.52,
+                debug: "仅运动判坡 · " + motionNote,
+                distance: distance
+            )
+        }
+        return nil
     }
 
     /// Theil-Sen fit followed by one trimming pass. Walls, doors and railings
@@ -438,9 +690,15 @@ final class DepthTerrainAnalyzer {
 
         let rowCount = 15
         let columnCount = 7
-        let binCount = 18
+        // Only obstacles inside 1.5 m are announced. Beyond that the corridor
+        // walls, doorways and furniture of every normal room would keep the
+        // alarm ringing, and at that range the user is not about to collide
+        // with it yet. The last bin ends exactly at 1.50 m, so nothing past
+        // the limit can produce a verdict.
         let binWidth: Float = 0.15
-        let firstDistance: Float = 0.45
+        let firstDistance: Float = 0.30
+        let limitDistance: Float = 1.50
+        let binCount = Int(((limitDistance - firstDistance) / binWidth).rounded())
         var binForward = Array(repeating: [Float](), count: binCount)
         var binHeight = Array(repeating: [Float](), count: binCount)
         var binColumns = [Int](repeating: 0, count: binCount)
@@ -461,7 +719,7 @@ final class DepthTerrainAnalyzer {
                 let worldPoint = cameraTransform * SIMD4<Float>(cameraPoint, 1.0)
                 let forward = hypot(worldPoint.x - cameraPosition.x, worldPoint.z - cameraPosition.z)
                 let height = worldPoint.y - cameraPosition.y
-                guard forward >= firstDistance, forward <= firstDistance + Float(binCount) * binWidth else { continue }
+                guard forward >= firstDistance, forward <= limitDistance else { continue }
                 let index = min(binCount - 1, Int((forward - firstDistance) / binWidth))
                 binForward[index].append(forward)
                 binHeight[index].append(height)
@@ -472,21 +730,23 @@ final class DepthTerrainAnalyzer {
         var best: ObstacleReport?
         for index in 0..<binCount {
             let heights = binHeight[index]
-            // A wall is seen by many pixels across several columns; a speckle
-            // or a single railing bar is not enough.
-            guard heights.count >= 10, binColumns[index].nonzeroBitCount >= 3 else { continue }
+            // A wall is seen by several pixels across at least two columns; a
+            // speckle or a single railing bar is not enough. The support bar is
+            // lower than before because a 0.15 m slice at 1.4 m only holds a
+            // handful of samples.
+            guard heights.count >= 5, binColumns[index].nonzeroBitCount >= 2 else { continue }
             let sorted = heights.sorted()
             let lowIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.10))
             let highIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.90))
             let span = sorted[highIndex] - sorted[lowIndex]
-            guard span >= 0.45 else { continue }
+            guard span >= 0.40 else { continue }
             guard let distance = median(binForward[index]) else { continue }
 
             if onStairs {
-                // On stairs only very close, genuinely tall obstructions are
-                // worth interrupting for; risers and the far stairwell wall
-                // must not turn into constant obstacle alarms.
-                guard distance >= 0.9, distance <= 1.6, span >= 0.60 else { continue }
+                // On stairs only genuinely tall obstructions are worth
+                // interrupting for; risers (about 0.17 m) and the stairwell
+                // wall must not turn into constant obstacle alarms.
+                guard distance >= 0.9, span >= 0.60 else { continue }
             } else if lastCameraBands >= 2 && span < 0.80 {
                 // Many visible tread edges plus a modest height spread reads
                 // as a staircase, not as an obstacle.
