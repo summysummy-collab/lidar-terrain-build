@@ -419,7 +419,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             detail += " · 中位距离 \(String(format: "%.1f", distance))m"
         }
         updateTerrain(result.kind, confidence: result.confidence, detail: detail)
-        statusLabel.text = "LiDAR + 摄像头融合 · 障碍检测 · 约 9–10 次/秒"
+        statusLabel.text = "v4 · LiDAR + 摄像头融合 · 障碍检测 · 9–10 次/秒"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()

@@ -62,6 +62,11 @@ final class DepthTerrainAnalyzer {
     private var obstacleHold = 0
     private var obstacleDistance: Float?
     private var obstacleConfirmed = false
+    private var obstacleDetail = ""
+    /// Stair direction is latched: weak "keep me on stairs" evidence may never
+    /// flip up/down on its own, only repeated strict geometry can.
+    private var stairDirection: Float = 0
+    private var reversalVotes = 0
 
     private var onStairs: Bool {
         lastStableKind == .stairsUp || lastStableKind == .stairsDown
@@ -76,6 +81,8 @@ final class DepthTerrainAnalyzer {
         obstacleHold = 0
         obstacleDistance = nil
         obstacleConfirmed = false
+        stairDirection = 0
+        reversalVotes = 0
     }
 
     func unavailable(_ message: String) -> TerrainResult {
@@ -194,9 +201,10 @@ final class DepthTerrainAnalyzer {
         // Obstacle check runs on its own narrow centre corridor, before the
         // floor-plane fit: a wall filling the view has a flat-looking profile
         // and would otherwise be reported as "平路".
-        if let obstacle = detectObstacle(frame: frame, displayTransform: displayTransform, depthAt: patchDepth) {
+        if let report = detectObstacle(frame: frame, displayTransform: displayTransform, depthAt: patchDepth) {
             obstacleStreak += 1
-            obstacleDistance = obstacle
+            obstacleDistance = report.distance
+            obstacleDetail = "高差 \(String(format: "%.2f", report.heightSpan))m · 支撑 \(report.support) 点"
             obstacleHold = 5
             if obstacleStreak >= 2 { obstacleConfirmed = true }
         } else {
@@ -213,7 +221,7 @@ final class DepthTerrainAnalyzer {
             return TerrainResult(
                 kind: .obstacle,
                 confidence: min(0.93, 0.60 + (2.8 - min(2.8, obstacle)) * 0.11),
-                debug: "中央通道出现竖直面 · 障碍 \(String(format: "%.1f", obstacle))m",
+                debug: "竖直面障碍 \(String(format: "%.1f", obstacle))m · \(obstacleDetail)",
                 distance: obstacle
             )
         }
@@ -227,9 +235,12 @@ final class DepthTerrainAnalyzer {
             )
         }
 
-        var binValues = Array(repeating: [Sample](), count: 9)
-        for sample in samples {
-            let index = min(8, max(0, Int((sample.forward - 0.4) / 0.4)))
+        // Only the near-to-mid field decides the walking surface. Distant bins
+        // are usually walls, doors or railings, and including them is what used
+        // to flip a descent into "上楼梯".
+        var binValues = Array(repeating: [Sample](), count: 8)
+        for sample in samples where sample.forward <= 2.6 {
+            let index = min(7, max(0, Int((sample.forward - 0.4) / 0.3)))
             binValues[index].append(sample)
         }
         var bins: [Bin] = []
@@ -247,24 +258,13 @@ final class DepthTerrainAnalyzer {
             )
         }
 
-        var pairSlopes: [Float] = []
-        for first in 0..<bins.count {
-            for second in (first + 1)..<bins.count {
-                let deltaDistance = bins[second].distance - bins[first].distance
-                if abs(deltaDistance) > 0.08 {
-                    pairSlopes.append((bins[second].height - bins[first].height) / deltaDistance)
-                }
-            }
-        }
-        guard let slope = median(pairSlopes) else {
+        guard let fit = fitProfile(bins) else {
             return held("无法拟合地面坡度", confidence: 0.2, distance: median(samples.map { $0.depth }))
         }
-        let intercept = median(bins.map { $0.height - slope * $0.distance }) ?? 0
-        let residual = sqrt(bins.reduce(Float(0)) { partial, bin in
-            let error = bin.height - (slope * bin.distance + intercept)
-            return partial + error * error
-        } / Float(bins.count))
-        let deltas = zip(bins.dropFirst(), bins).map { pair in
+        let slope = fit.slope
+        let residual = fit.residual
+        let profileBins = fit.bins
+        let deltas = zip(profileBins.dropFirst(), profileBins).map { pair in
             pair.0.height - pair.1.height
         }
         let direction: Float = slope >= 0 ? 1.0 : -1.0
@@ -276,9 +276,9 @@ final class DepthTerrainAnalyzer {
         let evidence = min(0.88, 0.40 + 0.25 * coverage + 0.20 * min(1.0, Float(bins.count) / 6.0))
         // A two-bin profile always fits a line perfectly, so its residual is not
         // trustworthy as evidence; cap the confidence in that case.
-        let thinProfile = bins.count < 3
+        let thinProfile = profileBins.count < 3
         let distance = median(samples.map { $0.depth })
-        let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount)"
+        let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount) · 区段 \(profileBins.count)/\(bins.count)"
 
         let raw: TerrainResult?
         if abs(degrees) <= 5.0 && residual <= 0.14 {
@@ -300,14 +300,35 @@ final class DepthTerrainAnalyzer {
             let stairCamera = lastCameraBands >= 2 && residual >= 0.04 && jumps >= 1
                 && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
             // Loosest tier: a single visible tread band plus any depth break.
-            let stairLoose = lastCameraBands >= 1 && residual >= 0.03 && jumps >= 1
-                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.40
+            let stairLoose = lastCameraBands >= 1 && residual >= 0.04 && jumps >= 1
+                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.50
             let slopeEvidence = residual <= 0.13 && abs(degrees) >= 4.5 && abs(degrees) <= 35 && monotonic >= 0.50
             if stairEvidence || stairContinue || stairCamera || stairLoose {
+                let measuredSign: Float = slope > 0 ? 1 : -1
+                if stairEvidence {
+                    if stairDirection == 0 {
+                        stairDirection = measuredSign
+                        reversalVotes = 0
+                    } else if measuredSign != stairDirection {
+                        // Six consecutive strict frames (~0.6s) are needed to
+                        // reverse a latched direction; noise cannot do it.
+                        // A clearly measured steep opposite slope counts double.
+                        reversalVotes += abs(degrees) >= 14 ? 2 : 1
+                        if reversalVotes >= 6 {
+                            stairDirection = measuredSign
+                            reversalVotes = 0
+                        }
+                    } else {
+                        reversalVotes = 0
+                    }
+                }
+                // Continuation / camera-only evidence keeps the current
+                // direction instead of being allowed to flip it.
+                let announcedSign = stairDirection == 0 ? measuredSign : stairDirection
                 let cameraBonus = 0.02 * Float(min(4, lastCameraBands))
                 let continueBonus: Float = (stairContinue || stairLoose) && !stairEvidence ? 0.02 : 0
                 raw = TerrainResult(
-                    kind: slope > 0 ? .stairsUp : .stairsDown,
+                    kind: announcedSign > 0 ? .stairsUp : .stairsDown,
                     confidence: min(0.94, evidence + 0.08 + cameraBonus + continueBonus),
                     debug: debug + " · 视觉台阶边 \(lastCameraBands) 组",
                     distance: distance
@@ -324,6 +345,11 @@ final class DepthTerrainAnalyzer {
             }
         }
 
+        let isStairRaw = raw?.kind == .stairsUp || raw?.kind == .stairsDown
+        if !isStairRaw && !onStairs {
+            stairDirection = 0
+            reversalVotes = 0
+        }
         guard let raw = raw else {
             return held("剖面混杂，暂无可判定的路面结构", confidence: 0.30, distance: distance)
         }
@@ -348,19 +374,61 @@ final class DepthTerrainAnalyzer {
         return stabilize(TerrainResult(kind: .unknown, confidence: max(0.15, confidence), debug: reason, distance: distance))
     }
 
-    /// Detects a vertical surface (wall, cabinet, parked bike, box, pillar)
-    /// standing inside the walking corridor.
+    private struct ProfileFit {
+        let slope: Float
+        let intercept: Float
+        let residual: Float
+        let bins: [Bin]
+    }
+
+    /// Theil-Sen fit followed by one trimming pass. Walls, doors and railings
+    /// behind / beyond the steps produce residuals far larger than a stair
+    /// tread, so they are removed before the slope sign is trusted.
+    private func fitProfile(_ input: [Bin]) -> ProfileFit? {
+        var current = input
+        var result: ProfileFit?
+        for _ in 0..<2 {
+            guard current.count >= 2 else { return result }
+            var pairSlopes: [Float] = []
+            for first in 0..<current.count {
+                for second in (first + 1)..<current.count {
+                    let deltaDistance = current[second].distance - current[first].distance
+                    if abs(deltaDistance) > 0.08 {
+                        pairSlopes.append((current[second].height - current[first].height) / deltaDistance)
+                    }
+                }
+            }
+            guard let slope = median(pairSlopes) else { return result }
+            let intercept = median(current.map { $0.height - slope * $0.distance }) ?? 0
+            let errors = current.map { abs($0.height - (slope * $0.distance + intercept)) }
+            let residual = sqrt(errors.reduce(Float(0)) { $0 + $1 * $1 } / Float(errors.count))
+            result = ProfileFit(slope: slope, intercept: intercept, residual: residual, bins: current)
+            let limit = max(0.28, residual * 2.2)
+            let inliers = zip(current, errors).filter { $0.1 <= limit }.map { $0.0 }
+            if inliers.count == current.count || inliers.count < 3 { break }
+            current = inliers
+        }
+        return result
+    }
+
+    private struct ObstacleReport {
+        let distance: Float
+        let heightSpan: Float
+        let support: Int
+    }
+
+    /// Obstacle = a vertical surface inside the walking corridor.
     ///
-    /// A vertical surface returns almost the same depth for many consecutive
-    /// image rows while its height above the camera changes a lot. Floor pixels
-    /// are the opposite: depth changes rapidly from row to row while height
-    /// stays on one plane. Both conditions are required, which keeps steep
-    /// floor views from being mistaken for obstacles.
+    /// Works in world coordinates, not in raw depth: on a wall, many points
+    /// share almost the same forward distance but span a large height range.
+    /// On the floor it is the opposite (forward spread is large, height is
+    /// nearly constant), so this test does not depend on how the phone is
+    /// tilted and does not fire on steep floor views.
     private func detectObstacle(
         frame: ARFrame,
         displayTransform: CGAffineTransform,
         depthAt: (Float, Float) -> Float?
-    ) -> Float? {
+    ) -> ObstacleReport? {
         let imageWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
         let imageHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
         let intrinsics = frame.camera.intrinsics
@@ -368,13 +436,17 @@ final class DepthTerrainAnalyzer {
         let cameraPosition = cameraTransform.columns.3
         let viewToImage = displayTransform.inverted()
 
-        let rowCount = 13
-        let columnCount = 5
-        var rowDepths = Array(repeating: [Float](), count: rowCount)
-        var rowHeights = Array(repeating: [Float](), count: rowCount)
+        let rowCount = 15
+        let columnCount = 7
+        let binCount = 18
+        let binWidth: Float = 0.15
+        let firstDistance: Float = 0.45
+        var binForward = Array(repeating: [Float](), count: binCount)
+        var binHeight = Array(repeating: [Float](), count: binCount)
+        var binColumns = [Int](repeating: 0, count: binCount)
 
         for row in 0..<rowCount {
-            let viewV = 0.26 + 0.70 * CGFloat(row) / CGFloat(rowCount - 1)
+            let viewV = 0.24 + 0.72 * CGFloat(row) / CGFloat(rowCount - 1)
             for column in 0..<columnCount {
                 let viewU = 0.36 + 0.28 * CGFloat(column) / CGFloat(columnCount - 1)
                 let imagePoint = CGPoint(x: viewU, y: viewV).applying(viewToImage)
@@ -387,76 +459,44 @@ final class DepthTerrainAnalyzer {
                 let rayY = -(v * imageHeight - intrinsics[2, 1]) / intrinsics[1, 1]
                 let cameraPoint = SIMD3<Float>(rayX * depth, rayY * depth, -depth)
                 let worldPoint = cameraTransform * SIMD4<Float>(cameraPoint, 1.0)
-                rowDepths[row].append(depth)
-                rowHeights[row].append(worldPoint.y - cameraPosition.y)
+                let forward = hypot(worldPoint.x - cameraPosition.x, worldPoint.z - cameraPosition.z)
+                let height = worldPoint.y - cameraPosition.y
+                guard forward >= firstDistance, forward <= firstDistance + Float(binCount) * binWidth else { continue }
+                let index = min(binCount - 1, Int((forward - firstDistance) / binWidth))
+                binForward[index].append(forward)
+                binHeight[index].append(height)
+                binColumns[index] |= 1 << column
             }
         }
 
-        var depthMedians = [Float?](repeating: nil, count: rowCount)
-        var heightMedians = [Float?](repeating: nil, count: rowCount)
-        var breadth = [Float](repeating: 0, count: rowCount)
-        for row in 0..<rowCount {
-            let values = rowDepths[row]
-            guard values.count >= 3, let value = median(values) else { continue }
-            depthMedians[row] = value
-            heightMedians[row] = median(rowHeights[row])
-            breadth[row] = Float(values.filter { abs($0 - value) <= value * 0.22 }.count) / Float(values.count)
-        }
+        var best: ObstacleReport?
+        for index in 0..<binCount {
+            let heights = binHeight[index]
+            // A wall is seen by many pixels across several columns; a speckle
+            // or a single railing bar is not enough.
+            guard heights.count >= 10, binColumns[index].nonzeroBitCount >= 3 else { continue }
+            let sorted = heights.sorted()
+            let lowIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.10))
+            let highIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.90))
+            let span = sorted[highIndex] - sorted[lowIndex]
+            guard span >= 0.45 else { continue }
+            guard let distance = median(binForward[index]) else { continue }
 
-        let minimumRows = onStairs ? 4 : 3
-        var nearest: Float?
-        var index = 0
-        while index < rowCount {
-            guard let base = depthMedians[index], breadth[index] >= 0.60 else {
-                index += 1
+            if onStairs {
+                // On stairs only very close, genuinely tall obstructions are
+                // worth interrupting for; risers and the far stairwell wall
+                // must not turn into constant obstacle alarms.
+                guard distance >= 0.9, distance <= 1.6, span >= 0.60 else { continue }
+            } else if lastCameraBands >= 2 && span < 0.80 {
+                // Many visible tread edges plus a modest height spread reads
+                // as a staircase, not as an obstacle.
                 continue
             }
-            var end = index
-            var runningMin = base
-            var runningMax = base
-            while end + 1 < rowCount,
-                  let next = depthMedians[end + 1], breadth[end + 1] >= 0.60 {
-                let newMin = min(runningMin, next)
-                let newMax = max(runningMax, next)
-                if newMax / max(newMin, 0.01) > 1.18 { break }
-                end += 1
-                runningMin = newMin
-                runningMax = newMax
-            }
 
-            let runLength = end - index + 1
-            let runDepths = depthMedians[index...end].compactMap { $0 }
-            let plateau = median(runDepths) ?? base
-            let runHeights = heightMedians[index...end].compactMap { $0 }
-            let heightSpan = (runHeights.max() ?? 0) - (runHeights.min() ?? 0)
-            let startsAtTop = index == 0
-            let endsAtBottom = end == rowCount - 1
-
-            if runLength >= minimumRows,
-               plateau >= 0.55, plateau <= 3.0,
-               heightSpan >= 0.25 {
-                var accepted = false
-                if startsAtTop {
-                    // Wall filling the upper view: needs a floor strip nearer
-                    // than the wall (otherwise it is a steep floor view), and
-                    // no tread bands that would explain it as a staircase.
-                    if endsAtBottom {
-                        accepted = lastCameraBands <= 1 && plateau <= 1.6 && !onStairs
-                    } else if let below = depthMedians[end + 1], below <= plateau * 0.92 {
-                        accepted = lastCameraBands <= 1 && !(onStairs && plateau < 1.1)
-                    }
-                } else if let beyond = depthMedians[index - 1], beyond >= plateau * 1.30 {
-                    // Object on the floor: the floor / space behind it is
-                    // clearly farther than the object face.
-                    accepted = !(onStairs && plateau < 1.0)
-                }
-                if accepted {
-                    nearest = min(nearest ?? .greatestFiniteMagnitude, plateau)
-                }
-            }
-            index = max(end + 1, index + 1)
+            let report = ObstacleReport(distance: distance, heightSpan: span, support: heights.count)
+            if best == nil || distance < best!.distance { best = report }
         }
-        return nearest
+        return best
     }
 
     /// Counts distinct stacked horizontal edge bands (stair treads) in the
