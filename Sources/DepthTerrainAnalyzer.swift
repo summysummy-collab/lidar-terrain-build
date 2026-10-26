@@ -48,10 +48,16 @@ final class DepthTerrainAnalyzer {
 
     private var history: [TerrainResult] = []
     private var lastStableKind: TerrainKind = .unknown
+    private var lastCameraBands = 0
+
+    private var onStairs: Bool {
+        lastStableKind == .stairsUp || lastStableKind == .stairsDown
+    }
 
     func reset() {
         history.removeAll()
         lastStableKind = .unknown
+        lastCameraBands = 0
     }
 
     func unavailable(_ message: String) -> TerrainResult {
@@ -92,8 +98,8 @@ final class DepthTerrainAnalyzer {
             CVPixelBufferGetBytesPerRow($0) / MemoryLayout<UInt8>.stride
         } ?? 0
 
-        let columns = 9
-        let rows = 13
+        let columns = 7
+        let rows = 9
         let imageWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
         let imageHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
         let intrinsics = frame.camera.intrinsics
@@ -147,8 +153,22 @@ final class DepthTerrainAnalyzer {
             ))
         }
 
+        // Camera evidence: count stacked horizontal tread edges in the live image.
+        lastCameraBands = cameraStairBands(frame)
+
         let validCount = samples.count
-        guard validCount >= 24 else {
+        guard validCount >= 18 else {
+            // Already traversing stairs: keep the current state instead of
+            // flickering to "unknown" while the LiDAR briefly loses the treads.
+            if onStairs {
+                let keep: TerrainKind = lastStableKind == .stairsUp ? .stairsUp : .stairsDown
+                return stabilize(TerrainResult(
+                    kind: keep,
+                    confidence: 0.50,
+                    debug: "楼梯延续判定 · 深度样本不足（\(validCount)）",
+                    distance: median(samples.map { $0.depth })
+                ))
+            }
             return stabilize(TerrainResult(
                 kind: .unknown,
                 confidence: 0.2,
@@ -170,7 +190,16 @@ final class DepthTerrainAnalyzer {
             bins.append(Bin(distance: binDistance, height: binHeight))
             _ = index
         }
-        guard bins.count >= 4 else {
+        guard bins.count >= 3 else {
+            if onStairs {
+                let keep: TerrainKind = lastStableKind == .stairsUp ? .stairsUp : .stairsDown
+                return stabilize(TerrainResult(
+                    kind: keep,
+                    confidence: 0.52,
+                    debug: "楼梯延续判定 · 剖面区段不足（\(bins.count)）",
+                    distance: median(samples.map { $0.depth })
+                ))
+            }
             return stabilize(TerrainResult(
                 kind: .unknown,
                 confidence: 0.25,
@@ -211,13 +240,24 @@ final class DepthTerrainAnalyzer {
         if abs(degrees) <= 4.5 && residual <= 0.12 {
             raw = TerrainResult(kind: .flat, confidence: evidence, debug: debug, distance: distance)
         } else {
+            // Full geometric stair evidence (strict, as before).
             let stairEvidence = residual >= 0.05 && jumps >= 2 && abs(degrees) >= 8 && abs(degrees) <= 45 && monotonic >= 0.60
+            // Continuation: once on stairs, a much weaker profile keeps the state
+            // so mid-stair frames stop reporting "unknown".
+            let stairContinue = onStairs && residual >= 0.04 && jumps >= 1
+                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
+            // Camera fusion: stacked tread edges in the live image can confirm
+            // stairs when the depth profile alone is borderline.
+            let stairCamera = lastCameraBands >= 2 && residual >= 0.04 && jumps >= 1
+                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
             let slopeEvidence = residual <= 0.11 && abs(degrees) >= 5 && abs(degrees) <= 35 && monotonic >= 0.55
-            if stairEvidence {
+            if stairEvidence || stairContinue || stairCamera {
+                let cameraBonus = 0.02 * Float(min(4, lastCameraBands))
+                let continueBonus: Float = stairContinue && !stairEvidence ? 0.02 : 0
                 raw = TerrainResult(
                     kind: slope > 0 ? .stairsUp : .stairsDown,
-                    confidence: min(0.92, evidence + 0.08),
-                    debug: debug,
+                    confidence: min(0.94, evidence + 0.08 + cameraBonus + continueBonus),
+                    debug: debug + " · 视觉台阶边 \(lastCameraBands) 组",
                     distance: distance
                 )
             } else if slopeEvidence {
@@ -227,6 +267,63 @@ final class DepthTerrainAnalyzer {
             }
         }
         return stabilize(raw)
+    }
+
+    /// Counts distinct stacked horizontal edge bands (stair treads) in the
+    /// camera image. Captured buffers are landscape; a horizontal line in the
+    /// portrait view is vertical in the sensor, so world-horizontal treads
+    /// produce a strong gradient along the sensor Y axis.
+    private func cameraStairBands(_ frame: ARFrame) -> Int {
+        let pixelBuffer = frame.capturedImage
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else { return 0 }
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return 0 }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return 0 }
+
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let luma = base.assumingMemoryBound(to: UInt8.self)
+
+        let step = 8
+        let x0 = width * 2 / 10, x1 = width * 8 / 10
+        let y0 = height * 15 / 100, y1 = height * 85 / 100
+        guard x1 - x0 > 3 * step, y1 - y0 > 3 * step else { return 0 }
+
+        var bandCounts = [Int](repeating: 0, count: height / step + 2)
+        var y = y0 + step
+        while y < y1 - step {
+            let rowBase = y * stride
+            var x = x0 + step
+            while x < x1 - step {
+                let center = Int(luma[rowBase + x])
+                let gy = Int(luma[rowBase - stride + x]) - Int(luma[rowBase + stride + x])
+                let gx = Int(luma[rowBase + x - step]) - Int(luma[rowBase + x + step])
+                if abs(gy) > 26 && abs(gy) > 2 * abs(gx) {
+                    bandCounts[y / step] += 1
+                }
+                _ = center
+                x += step
+            }
+            y += step
+        }
+
+        // Cluster band rows separated by gaps into distinct tread groups.
+        var bands = 0
+        var inBand = false
+        var gap = 0
+        for count in bandCounts {
+            if count >= 4 {
+                if !inBand { bands += 1; inBand = true }
+                gap = 0
+            } else if inBand {
+                gap += 1
+                if gap >= 2 { inBand = false }
+            }
+        }
+        return bands
     }
 
     private func detectDropOff(rowDepths: [[Float]]) -> Float? {
@@ -252,8 +349,8 @@ final class DepthTerrainAnalyzer {
     private func stabilize(_ raw: TerrainResult) -> TerrainResult {
         history.append(raw)
         if history.count > 8 { history.removeFirst() }
-        let recent = history.suffix(3)
-        if recent.count == 3 && recent.allSatisfy({ $0.kind == .unknown }) {
+        let clearWindow = history.suffix(onStairs ? 6 : 4)
+        if clearWindow.count == (onStairs ? 6 : 4) && clearWindow.allSatisfy({ $0.kind == .unknown }) {
             lastStableKind = .unknown
             return TerrainResult(
                 kind: .unknown,

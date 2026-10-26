@@ -246,7 +246,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         analysisQueue.async { [weak self] in
             guard let self = self, self.running,
-                  frame.timestamp - self.lastAnalysisTimestamp >= 0.15 else { return }
+                  frame.timestamp - self.lastAnalysisTimestamp >= 0.10 else { return }
             self.lastAnalysisTimestamp = frame.timestamp
             let displayTransform = frame.displayTransform(for: .portrait, viewportSize: self.viewportSize)
             let result = self.analyzer.analyze(frame: frame, displayTransform: displayTransform)
@@ -264,7 +264,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             detail += " · 中位距离 \(String(format: "%.1f", distance))m"
         }
         updateTerrain(result.kind, confidence: result.confidence, detail: detail)
-        statusLabel.text = "LiDAR 本机实时分析 · 约 6–7 次/秒"
+        statusLabel.text = "LiDAR + 摄像头融合 · 约 9–10 次/秒"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
