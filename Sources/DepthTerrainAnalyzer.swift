@@ -10,6 +10,7 @@ enum TerrainKind: String {
     case downhill = "下坡"
     case stairsUp = "上楼梯"
     case stairsDown = "下楼梯"
+    case obstacle = "前方障碍"
     case dropOff = "前方深度断层"
 }
 
@@ -27,6 +28,10 @@ struct TerrainResult {
         case .downhill: return "前方下坡，注意脚下"
         case .stairsUp: return "前方上楼梯，注意台阶"
         case .stairsDown: return "前方下楼梯，注意台阶"
+        case .obstacle:
+            guard let distance = distance else { return "注意，前方有障碍" }
+            let rounded = min(3.0, max(0.5, (distance * 2).rounded() / 2))
+            return "注意，前方约 \(String(format: "%.1f", rounded)) 米有障碍"
         case .dropOff: return "注意，前方深度断层，请停止前行"
         }
     }
@@ -49,6 +54,14 @@ final class DepthTerrainAnalyzer {
     private var history: [TerrainResult] = []
     private var lastStableKind: TerrainKind = .unknown
     private var lastCameraBands = 0
+    /// Consecutive frames where the depth profile was too poor to classify.
+    /// Used to keep the previous verdict alive for a short while instead of
+    /// flickering to "路况待确认" on every transient dropout.
+    private var degradedFrames = 0
+    private var obstacleStreak = 0
+    private var obstacleHold = 0
+    private var obstacleDistance: Float?
+    private var obstacleConfirmed = false
 
     private var onStairs: Bool {
         lastStableKind == .stairsUp || lastStableKind == .stairsDown
@@ -58,6 +71,11 @@ final class DepthTerrainAnalyzer {
         history.removeAll()
         lastStableKind = .unknown
         lastCameraBands = 0
+        degradedFrames = 0
+        obstacleStreak = 0
+        obstacleHold = 0
+        obstacleDistance = nil
+        obstacleConfirmed = false
     }
 
     func unavailable(_ message: String) -> TerrainResult {
@@ -110,6 +128,30 @@ final class DepthTerrainAnalyzer {
         samples.reserveCapacity(columns * rows)
         let viewToImage = displayTransform.inverted()
 
+        // A single pixel is fragile: LiDAR holes and low-confidence speckles are
+        // common indoors. Taking the median of a 3x3 patch lifts the usable
+        // sample rate sharply, which is what removes most "样本不足" verdicts.
+        func patchDepth(_ u: Float, _ v: Float) -> Float? {
+            let centerX = min(depthWidth - 1, max(0, Int(u * Float(depthWidth - 1))))
+            let centerY = min(depthHeight - 1, max(0, Int(v * Float(depthHeight - 1))))
+            var values: [Float] = []
+            values.reserveCapacity(9)
+            for dy in -1...1 {
+                let y = centerY + dy
+                if y < 0 || y >= depthHeight { continue }
+                for dx in -1...1 {
+                    let x = centerX + dx
+                    if x < 0 || x >= depthWidth { continue }
+                    let depth = depthPointer[y * depthStride + x]
+                    guard depth.isFinite, depth >= 0.25, depth <= 6.0 else { continue }
+                    if let confidencePointer = confidencePointer,
+                       confidencePointer[y * confidenceStride + x] == 0 { continue }
+                    values.append(depth)
+                }
+            }
+            return median(values)
+        }
+
         for row in 0..<rows {
             let viewV = 0.28 + 0.66 * CGFloat(row) / CGFloat(rows - 1)
             for column in 0..<columns {
@@ -118,15 +160,7 @@ final class DepthTerrainAnalyzer {
                 let u = Float(imagePoint.x)
                 let v = Float(imagePoint.y)
                 guard u >= 0, u <= 1, v >= 0, v <= 1 else { continue }
-                let x = min(depthWidth - 1, max(0, Int(u * Float(depthWidth - 1))))
-                let y = min(depthHeight - 1, max(0, Int(v * Float(depthHeight - 1))))
-                let depth = depthPointer[y * depthStride + x]
-                guard depth.isFinite, depth >= 0.25, depth <= 6.0 else { continue }
-
-                if let confidencePointer = confidencePointer {
-                    let confidence = confidencePointer[y * confidenceStride + x]
-                    if confidence == 0 { continue }
-                }
+                guard let depth = patchDepth(u, v) else { continue }
                 rowDepths[row].append(depth)
 
                 let pixelX = u * imageWidth
@@ -144,7 +178,11 @@ final class DepthTerrainAnalyzer {
             }
         }
 
+        // Camera evidence: count stacked horizontal tread edges in the live image.
+        lastCameraBands = cameraStairBands(frame)
+
         if let dropOff = detectDropOff(rowDepths: rowDepths) {
+            degradedFrames = 0
             return stabilize(TerrainResult(
                 kind: .dropOff,
                 confidence: dropOff,
@@ -153,28 +191,40 @@ final class DepthTerrainAnalyzer {
             ))
         }
 
-        // Camera evidence: count stacked horizontal tread edges in the live image.
-        lastCameraBands = cameraStairBands(frame)
+        // Obstacle check runs on its own narrow centre corridor, before the
+        // floor-plane fit: a wall filling the view has a flat-looking profile
+        // and would otherwise be reported as "平路".
+        if let obstacle = detectObstacle(frame: frame, displayTransform: displayTransform, depthAt: patchDepth) {
+            obstacleStreak += 1
+            obstacleDistance = obstacle
+            obstacleHold = 5
+            if obstacleStreak >= 2 { obstacleConfirmed = true }
+        } else {
+            obstacleStreak = 0
+            if obstacleHold > 0 {
+                obstacleHold -= 1
+            } else {
+                obstacleDistance = nil
+                obstacleConfirmed = false
+            }
+        }
+        if obstacleConfirmed, let obstacle = obstacleDistance {
+            degradedFrames = 0
+            return TerrainResult(
+                kind: .obstacle,
+                confidence: min(0.93, 0.60 + (2.8 - min(2.8, obstacle)) * 0.11),
+                debug: "中央通道出现竖直面 · 障碍 \(String(format: "%.1f", obstacle))m",
+                distance: obstacle
+            )
+        }
 
         let validCount = samples.count
-        guard validCount >= 18 else {
-            // Already traversing stairs: keep the current state instead of
-            // flickering to "unknown" while the LiDAR briefly loses the treads.
-            if onStairs {
-                let keep: TerrainKind = lastStableKind == .stairsUp ? .stairsUp : .stairsDown
-                return stabilize(TerrainResult(
-                    kind: keep,
-                    confidence: 0.50,
-                    debug: "楼梯延续判定 · 深度样本不足（\(validCount)）",
-                    distance: median(samples.map { $0.depth })
-                ))
-            }
-            return stabilize(TerrainResult(
-                kind: .unknown,
+        guard validCount >= 12 else {
+            return held(
+                "有效深度样本不足（\(validCount)）",
                 confidence: 0.2,
-                debug: "有效深度样本不足（\(validCount)），请对准前方地面",
                 distance: median(samples.map { $0.depth })
-            ))
+            )
         }
 
         var binValues = Array(repeating: [Sample](), count: 9)
@@ -183,29 +233,18 @@ final class DepthTerrainAnalyzer {
             binValues[index].append(sample)
         }
         var bins: [Bin] = []
-        for (index, values) in binValues.enumerated() where values.count >= 3 {
+        for values in binValues where values.count >= 3 {
             let heights = values.map { $0.height }
             let distances = values.map { $0.forward }
             guard let binHeight = median(heights), let binDistance = median(distances) else { continue }
             bins.append(Bin(distance: binDistance, height: binHeight))
-            _ = index
         }
-        guard bins.count >= 3 else {
-            if onStairs {
-                let keep: TerrainKind = lastStableKind == .stairsUp ? .stairsUp : .stairsDown
-                return stabilize(TerrainResult(
-                    kind: keep,
-                    confidence: 0.52,
-                    debug: "楼梯延续判定 · 剖面区段不足（\(bins.count)）",
-                    distance: median(samples.map { $0.depth })
-                ))
-            }
-            return stabilize(TerrainResult(
-                kind: .unknown,
+        guard bins.count >= 2 else {
+            return held(
+                "前方地面剖面不完整，仅有 \(bins.count) 个有效区段",
                 confidence: 0.25,
-                debug: "前方地面剖面不完整，仅有 \(bins.count) 个有效区段",
                 distance: median(samples.map { $0.depth })
-            ))
+            )
         }
 
         var pairSlopes: [Float] = []
@@ -217,7 +256,9 @@ final class DepthTerrainAnalyzer {
                 }
             }
         }
-        guard let slope = median(pairSlopes) else { return nil }
+        guard let slope = median(pairSlopes) else {
+            return held("无法拟合地面坡度", confidence: 0.2, distance: median(samples.map { $0.depth }))
+        }
         let intercept = median(bins.map { $0.height - slope * $0.distance }) ?? 0
         let residual = sqrt(bins.reduce(Float(0)) { partial, bin in
             let error = bin.height - (slope * bin.distance + intercept)
@@ -233,12 +274,20 @@ final class DepthTerrainAnalyzer {
         let degrees = atan(slope) * 180.0 / .pi
         let coverage = Float(validCount) / Float(columns * rows)
         let evidence = min(0.88, 0.40 + 0.25 * coverage + 0.20 * min(1.0, Float(bins.count) / 6.0))
+        // A two-bin profile always fits a line perfectly, so its residual is not
+        // trustworthy as evidence; cap the confidence in that case.
+        let thinProfile = bins.count < 3
         let distance = median(samples.map { $0.depth })
         let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount)"
 
-        let raw: TerrainResult
-        if abs(degrees) <= 4.5 && residual <= 0.12 {
-            raw = TerrainResult(kind: .flat, confidence: evidence, debug: debug, distance: distance)
+        let raw: TerrainResult?
+        if abs(degrees) <= 5.0 && residual <= 0.14 {
+            raw = TerrainResult(
+                kind: .flat,
+                confidence: thinProfile ? min(evidence, 0.55) : evidence,
+                debug: debug,
+                distance: distance
+            )
         } else {
             // Full geometric stair evidence (strict, as before).
             let stairEvidence = residual >= 0.05 && jumps >= 2 && abs(degrees) >= 8 && abs(degrees) <= 45 && monotonic >= 0.60
@@ -250,10 +299,13 @@ final class DepthTerrainAnalyzer {
             // stairs when the depth profile alone is borderline.
             let stairCamera = lastCameraBands >= 2 && residual >= 0.04 && jumps >= 1
                 && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
-            let slopeEvidence = residual <= 0.11 && abs(degrees) >= 5 && abs(degrees) <= 35 && monotonic >= 0.55
-            if stairEvidence || stairContinue || stairCamera {
+            // Loosest tier: a single visible tread band plus any depth break.
+            let stairLoose = lastCameraBands >= 1 && residual >= 0.03 && jumps >= 1
+                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.40
+            let slopeEvidence = residual <= 0.13 && abs(degrees) >= 4.5 && abs(degrees) <= 35 && monotonic >= 0.50
+            if stairEvidence || stairContinue || stairCamera || stairLoose {
                 let cameraBonus = 0.02 * Float(min(4, lastCameraBands))
-                let continueBonus: Float = stairContinue && !stairEvidence ? 0.02 : 0
+                let continueBonus: Float = (stairContinue || stairLoose) && !stairEvidence ? 0.02 : 0
                 raw = TerrainResult(
                     kind: slope > 0 ? .stairsUp : .stairsDown,
                     confidence: min(0.94, evidence + 0.08 + cameraBonus + continueBonus),
@@ -261,12 +313,150 @@ final class DepthTerrainAnalyzer {
                     distance: distance
                 )
             } else if slopeEvidence {
-                raw = TerrainResult(kind: slope > 0 ? .uphill : .downhill, confidence: evidence, debug: debug, distance: distance)
+                raw = TerrainResult(
+                    kind: slope > 0 ? .uphill : .downhill,
+                    confidence: thinProfile ? min(evidence, 0.55) : evidence,
+                    debug: debug,
+                    distance: distance
+                )
             } else {
-                raw = TerrainResult(kind: .unknown, confidence: 0.35, debug: debug, distance: distance)
+                raw = nil
             }
         }
+
+        guard let raw = raw else {
+            return held("剖面混杂，暂无可判定的路面结构", confidence: 0.30, distance: distance)
+        }
+        degradedFrames = 0
         return stabilize(raw)
+    }
+
+    /// Keeps the previous verdict for a short grace period instead of
+    /// announcing "路况待确认" on every isolated bad frame.
+    private func held(_ reason: String, confidence: Float, distance: Float?) -> TerrainResult {
+        degradedFrames += 1
+        let previous = lastStableKind
+        let canHold = previous != .unknown && previous != .dropOff && previous != .obstacle
+        if canHold && degradedFrames <= 12 {
+            return stabilize(TerrainResult(
+                kind: previous,
+                confidence: max(0.45, confidence),
+                debug: reason + " · 延续上一判定",
+                distance: distance
+            ))
+        }
+        return stabilize(TerrainResult(kind: .unknown, confidence: max(0.15, confidence), debug: reason, distance: distance))
+    }
+
+    /// Detects a vertical surface (wall, cabinet, parked bike, box, pillar)
+    /// standing inside the walking corridor.
+    ///
+    /// A vertical surface returns almost the same depth for many consecutive
+    /// image rows while its height above the camera changes a lot. Floor pixels
+    /// are the opposite: depth changes rapidly from row to row while height
+    /// stays on one plane. Both conditions are required, which keeps steep
+    /// floor views from being mistaken for obstacles.
+    private func detectObstacle(
+        frame: ARFrame,
+        displayTransform: CGAffineTransform,
+        depthAt: (Float, Float) -> Float?
+    ) -> Float? {
+        let imageWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
+        let imageHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
+        let intrinsics = frame.camera.intrinsics
+        let cameraTransform = frame.camera.transform
+        let cameraPosition = cameraTransform.columns.3
+        let viewToImage = displayTransform.inverted()
+
+        let rowCount = 13
+        let columnCount = 5
+        var rowDepths = Array(repeating: [Float](), count: rowCount)
+        var rowHeights = Array(repeating: [Float](), count: rowCount)
+
+        for row in 0..<rowCount {
+            let viewV = 0.26 + 0.70 * CGFloat(row) / CGFloat(rowCount - 1)
+            for column in 0..<columnCount {
+                let viewU = 0.36 + 0.28 * CGFloat(column) / CGFloat(columnCount - 1)
+                let imagePoint = CGPoint(x: viewU, y: viewV).applying(viewToImage)
+                let u = Float(imagePoint.x)
+                let v = Float(imagePoint.y)
+                guard u >= 0, u <= 1, v >= 0, v <= 1 else { continue }
+                guard let depth = depthAt(u, v) else { continue }
+
+                let rayX = (u * imageWidth - intrinsics[2, 0]) / intrinsics[0, 0]
+                let rayY = -(v * imageHeight - intrinsics[2, 1]) / intrinsics[1, 1]
+                let cameraPoint = SIMD3<Float>(rayX * depth, rayY * depth, -depth)
+                let worldPoint = cameraTransform * SIMD4<Float>(cameraPoint, 1.0)
+                rowDepths[row].append(depth)
+                rowHeights[row].append(worldPoint.y - cameraPosition.y)
+            }
+        }
+
+        var depthMedians = [Float?](repeating: nil, count: rowCount)
+        var heightMedians = [Float?](repeating: nil, count: rowCount)
+        var breadth = [Float](repeating: 0, count: rowCount)
+        for row in 0..<rowCount {
+            let values = rowDepths[row]
+            guard values.count >= 3, let value = median(values) else { continue }
+            depthMedians[row] = value
+            heightMedians[row] = median(rowHeights[row])
+            breadth[row] = Float(values.filter { abs($0 - value) <= value * 0.22 }.count) / Float(values.count)
+        }
+
+        let minimumRows = onStairs ? 4 : 3
+        var nearest: Float?
+        var index = 0
+        while index < rowCount {
+            guard let base = depthMedians[index], breadth[index] >= 0.60 else {
+                index += 1
+                continue
+            }
+            var end = index
+            var runningMin = base
+            var runningMax = base
+            while end + 1 < rowCount,
+                  let next = depthMedians[end + 1], breadth[end + 1] >= 0.60 {
+                let newMin = min(runningMin, next)
+                let newMax = max(runningMax, next)
+                if newMax / max(newMin, 0.01) > 1.18 { break }
+                end += 1
+                runningMin = newMin
+                runningMax = newMax
+            }
+
+            let runLength = end - index + 1
+            let runDepths = depthMedians[index...end].compactMap { $0 }
+            let plateau = median(runDepths) ?? base
+            let runHeights = heightMedians[index...end].compactMap { $0 }
+            let heightSpan = (runHeights.max() ?? 0) - (runHeights.min() ?? 0)
+            let startsAtTop = index == 0
+            let endsAtBottom = end == rowCount - 1
+
+            if runLength >= minimumRows,
+               plateau >= 0.55, plateau <= 3.0,
+               heightSpan >= 0.25 {
+                var accepted = false
+                if startsAtTop {
+                    // Wall filling the upper view: needs a floor strip nearer
+                    // than the wall (otherwise it is a steep floor view), and
+                    // no tread bands that would explain it as a staircase.
+                    if endsAtBottom {
+                        accepted = lastCameraBands <= 1 && plateau <= 1.6 && !onStairs
+                    } else if let below = depthMedians[end + 1], below <= plateau * 0.92 {
+                        accepted = lastCameraBands <= 1 && !(onStairs && plateau < 1.1)
+                    }
+                } else if let beyond = depthMedians[index - 1], beyond >= plateau * 1.30 {
+                    // Object on the floor: the floor / space behind it is
+                    // clearly farther than the object face.
+                    accepted = !(onStairs && plateau < 1.0)
+                }
+                if accepted {
+                    nearest = min(nearest ?? .greatestFiniteMagnitude, plateau)
+                }
+            }
+            index = max(end + 1, index + 1)
+        }
+        return nearest
     }
 
     /// Counts distinct stacked horizontal edge bands (stair treads) in the
@@ -349,8 +539,8 @@ final class DepthTerrainAnalyzer {
     private func stabilize(_ raw: TerrainResult) -> TerrainResult {
         history.append(raw)
         if history.count > 8 { history.removeFirst() }
-        let clearWindow = history.suffix(onStairs ? 6 : 4)
-        if clearWindow.count == (onStairs ? 6 : 4) && clearWindow.allSatisfy({ $0.kind == .unknown }) {
+        let clearWindow = history.suffix(9)
+        if clearWindow.count == 9 && clearWindow.allSatisfy({ $0.kind == .unknown }) {
             lastStableKind = .unknown
             return TerrainResult(
                 kind: .unknown,
@@ -376,8 +566,11 @@ final class DepthTerrainAnalyzer {
         let candidateResults = window.filter { $0.kind == candidate }
         let meanConfidence = candidateResults.reduce(Float(0)) { $0 + $1.confidence } / Float(max(1, candidateResults.count))
 
-        guard count >= requiredCount, share >= 0.50, meanConfidence >= 0.45 else {
-            return TerrainResult(kind: lastStableKind, confidence: meanConfidence, debug: raw.debug + " · 正在确认", distance: raw.distance)
+        guard count >= requiredCount, share >= 0.50, meanConfidence >= 0.40 else {
+            // While waiting for confirmation, keep showing the last stable
+            // verdict rather than the placeholder.
+            let shown: TerrainKind = lastStableKind == .unknown ? .unknown : lastStableKind
+            return TerrainResult(kind: shown, confidence: meanConfidence, debug: raw.debug + " · 正在确认", distance: raw.distance)
         }
         lastStableKind = candidate
         return TerrainResult(

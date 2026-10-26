@@ -11,11 +11,17 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
     private let terrainLabel = UILabel()
     private let evidenceLabel = UILabel()
     private let detailLabel = UILabel()
+    private let depthOverlay = UIImageView()
+    private let legendLabel = UILabel()
     private let startButton = UIButton(type: .system)
     private let voiceSwitch = UISwitch()
+    private let depthSwitch = UISwitch()
     private let analysisQueue = DispatchQueue(label: "com.walkassist.terrain.analysis", qos: .userInitiated)
     private let stateLock = NSLock()
     private var runningStorage = false
+    /// Only touched on analysisQueue so the render loop can read it safely.
+    private var overlayEnabled = false
+    private var overlayTick = 0
     private var running: Bool {
         get {
             stateLock.lock()
@@ -74,6 +80,19 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             arView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
 
+        depthOverlay.translatesAutoresizingMaskIntoConstraints = false
+        depthOverlay.contentMode = .scaleToFill
+        depthOverlay.isUserInteractionEnabled = false
+        depthOverlay.isHidden = true
+        depthOverlay.alpha = 0.55
+        view.addSubview(depthOverlay)
+        NSLayoutConstraint.activate([
+            depthOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
+            depthOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
+            depthOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
+            depthOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor)
+        ])
+
         let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemMaterialDark))
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.layer.cornerRadius = 18
@@ -106,7 +125,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         ])
 
         let aimingLabel = UILabel()
-        aimingLabel.text = "将中央区域对准前方地面\n手机尽量固定在胸前，避免大幅摆动"
+        aimingLabel.text = "将中央区域对准前方地面\n手机固定在胸前，避免大幅摆动"
         aimingLabel.textAlignment = .center
         aimingLabel.numberOfLines = 2
         aimingLabel.font = .systemFont(ofSize: 13, weight: .medium)
@@ -141,17 +160,25 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
 
         voiceSwitch.isOn = true
         voiceSwitch.addTarget(self, action: #selector(voiceSwitchChanged), for: .valueChanged)
-        voiceSwitch.translatesAutoresizingMaskIntoConstraints = false
-        let voiceLabel = UILabel()
-        voiceLabel.text = "语音提醒"
-        voiceLabel.textColor = .white
-        voiceLabel.font = .systemFont(ofSize: 15, weight: .medium)
-        let voiceStack = UIStackView(arrangedSubviews: [voiceLabel, voiceSwitch])
-        voiceStack.axis = .horizontal
-        voiceStack.spacing = 8
-        voiceStack.alignment = .center
-        voiceStack.translatesAutoresizingMaskIntoConstraints = false
-        bottomPanel.contentView.addSubview(voiceStack)
+        depthSwitch.isOn = false
+        depthSwitch.addTarget(self, action: #selector(depthSwitchChanged), for: .valueChanged)
+
+        let voiceStack = toggleRow(title: "语音提醒", control: voiceSwitch)
+        let depthStack = toggleRow(title: "深度叠加", control: depthSwitch)
+        let toggleStack = UIStackView(arrangedSubviews: [voiceStack, depthStack])
+        toggleStack.axis = .horizontal
+        toggleStack.spacing = 20
+        toggleStack.alignment = .center
+        toggleStack.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanel.contentView.addSubview(toggleStack)
+
+        legendLabel.text = "叠加色标：红 0.5m · 黄 1.2m · 青 2.4m · 蓝 4m 以上"
+        legendLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        legendLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+        legendLabel.textAlignment = .center
+        legendLabel.isHidden = true
+        legendLabel.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanel.contentView.addSubview(legendLabel)
 
         let warningLabel = UILabel()
         warningLabel.text = "实验性辅助提醒，不能替代观察路面或导盲设施"
@@ -171,13 +198,28 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             startButton.leadingAnchor.constraint(equalTo: bottomPanel.contentView.leadingAnchor, constant: 14),
             startButton.trailingAnchor.constraint(equalTo: bottomPanel.contentView.trailingAnchor, constant: -14),
             startButton.heightAnchor.constraint(equalToConstant: 52),
-            voiceStack.topAnchor.constraint(equalTo: startButton.bottomAnchor, constant: 8),
-            voiceStack.centerXAnchor.constraint(equalTo: bottomPanel.contentView.centerXAnchor),
-            warningLabel.topAnchor.constraint(equalTo: voiceStack.bottomAnchor, constant: 6),
+            toggleStack.topAnchor.constraint(equalTo: startButton.bottomAnchor, constant: 8),
+            toggleStack.centerXAnchor.constraint(equalTo: bottomPanel.contentView.centerXAnchor),
+            legendLabel.topAnchor.constraint(equalTo: toggleStack.bottomAnchor, constant: 6),
+            legendLabel.leadingAnchor.constraint(equalTo: bottomPanel.contentView.leadingAnchor, constant: 8),
+            legendLabel.trailingAnchor.constraint(equalTo: bottomPanel.contentView.trailingAnchor, constant: -8),
+            warningLabel.topAnchor.constraint(equalTo: legendLabel.bottomAnchor, constant: 4),
             warningLabel.leadingAnchor.constraint(equalTo: bottomPanel.contentView.leadingAnchor, constant: 8),
             warningLabel.trailingAnchor.constraint(equalTo: bottomPanel.contentView.trailingAnchor, constant: -8),
             warningLabel.bottomAnchor.constraint(equalTo: bottomPanel.contentView.bottomAnchor, constant: -10)
         ])
+    }
+
+    private func toggleRow(title: String, control: UISwitch) -> UIStackView {
+        let label = UILabel()
+        label.text = title
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 15, weight: .medium)
+        let row = UIStackView(arrangedSubviews: [label, control])
+        row.axis = .horizontal
+        row.spacing = 8
+        row.alignment = .center
+        return row
     }
 
     private func configure(_ label: UILabel, size: CGFloat, weight: UIFont.Weight) {
@@ -188,6 +230,17 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
 
     @objc private func voiceSwitchChanged() {
         if !voiceSwitch.isOn { speech.stop() }
+    }
+
+    @objc private func depthSwitchChanged() {
+        let enabled = depthSwitch.isOn
+        analysisQueue.sync {
+            overlayEnabled = enabled
+            overlayTick = 0
+        }
+        legendLabel.isHidden = !enabled
+        depthOverlay.isHidden = !enabled
+        if !enabled { depthOverlay.image = nil }
     }
 
     @objc private func toggleRunning() {
@@ -236,6 +289,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             lastAnalysisTimestamp = 0
         }
         speech.stop()
+        depthOverlay.image = nil
         UIApplication.shared.isIdleTimerDisabled = false
         startButton.setTitle("开始识别", for: .normal)
         startButton.backgroundColor = UIColor(red: 0.12, green: 0.48, blue: 0.95, alpha: 1)
@@ -251,10 +305,111 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             let displayTransform = frame.displayTransform(for: .portrait, viewportSize: self.viewportSize)
             let result = self.analyzer.analyze(frame: frame, displayTransform: displayTransform)
                 ?? self.analyzer.unavailable("连续深度帧不可用，请检查镜头遮挡并缓慢移动")
+            var overlay: UIImage?
+            if self.overlayEnabled {
+                self.overlayTick += 1
+                if self.overlayTick % 2 == 1 {
+                    overlay = self.makeDepthOverlay(frame: frame, displayTransform: displayTransform)
+                }
+            }
             DispatchQueue.main.async { [weak self] in
-                self?.apply(result)
+                guard let self = self else { return }
+                if let overlay = overlay, self.overlayEnabled {
+                    self.depthOverlay.image = overlay
+                }
+                self.apply(result)
             }
         }
+    }
+
+    /// Renders the LiDAR depth map as a colour image sampled through the same
+    /// display transform the analyzer uses, so the overlay lines up with the
+    /// camera picture instead of drifting.
+    private func makeDepthOverlay(frame: ARFrame, displayTransform: CGAffineTransform) -> UIImage? {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        let map = depthData.depthMap
+        guard CVPixelBufferGetPixelFormatType(map) == kCVPixelFormatType_DepthFloat32,
+              CVPixelBufferLockBaseAddress(map, .readOnly) == kCVReturnSuccess,
+              let base = CVPixelBufferGetBaseAddress(map) else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+
+        let mapWidth = CVPixelBufferGetWidth(map)
+        let mapHeight = CVPixelBufferGetHeight(map)
+        let stride = CVPixelBufferGetBytesPerRow(map) / MemoryLayout<Float>.stride
+        let pointer = base.assumingMemoryBound(to: Float.self)
+
+        let gridWidth = 72
+        let viewportWidth = max(CGFloat(1), viewportSize.width)
+        let aspect = max(CGFloat(1), viewportSize.height / viewportWidth)
+        let gridHeight = max(16, Int((CGFloat(gridWidth) * aspect).rounded()))
+        var bytes = [UInt8](repeating: 0, count: gridWidth * gridHeight * 4)
+
+        for row in 0..<gridHeight {
+            let viewV = (CGFloat(row) + 0.5) / CGFloat(gridHeight)
+            for column in 0..<gridWidth {
+                let viewU = (CGFloat(column) + 0.5) / CGFloat(gridWidth)
+                let imagePoint = CGPoint(x: viewU, y: viewV).applying(displayTransform)
+                let x = Int(imagePoint.x * CGFloat(mapWidth - 1))
+                let y = Int(imagePoint.y * CGFloat(mapHeight - 1))
+                guard x >= 0, x < mapWidth, y >= 0, y < mapHeight else { continue }
+                let depth = pointer[y * stride + x]
+                guard depth.isFinite, depth > 0.1, depth <= 6.0 else { continue }
+                let color = TerrainViewController.overlayColor(for: depth)
+                let index = (row * gridWidth + column) * 4
+                bytes[index] = color.0
+                bytes[index + 1] = color.1
+                bytes[index + 2] = color.2
+                bytes[index + 3] = 255
+            }
+        }
+
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let cgImage = CGImage(
+                width: gridWidth,
+                height: gridHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: gridWidth * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+              ) else { return nil }
+        return UIImage(cgImage: cgImage)
+    }
+
+    /// Red = very close, orange/yellow = walking range, cyan/blue = open space.
+    private static func overlayColor(for depth: Float) -> (UInt8, UInt8, UInt8) {
+        let stops: [(Float, Float, Float, Float)] = [
+            (0.30, 255, 40, 40),
+            (0.80, 255, 140, 0),
+            (1.40, 255, 220, 40),
+            (2.20, 60, 220, 180),
+            (3.20, 60, 160, 255),
+            (4.50, 90, 90, 255)
+        ]
+        func channel(_ value: Float) -> UInt8 {
+            UInt8(max(0, min(255, value)))
+        }
+        if depth <= stops[0].0 {
+            let first = stops[0]
+            return (channel(first.1), channel(first.2), channel(first.3))
+        }
+        for index in 1..<stops.count where depth <= stops[index].0 {
+            let low = stops[index - 1]
+            let high = stops[index]
+            let span = max(0.01, high.0 - low.0)
+            let t = (depth - low.0) / span
+            return (
+                channel(low.1 + (high.1 - low.1) * t),
+                channel(low.2 + (high.2 - low.2) * t),
+                channel(low.3 + (high.3 - low.3) * t)
+            )
+        }
+        let last = stops[stops.count - 1]
+        return (channel(last.1), channel(last.2), channel(last.3))
     }
 
     private func apply(_ result: TerrainResult) {
@@ -264,18 +419,19 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             detail += " · 中位距离 \(String(format: "%.1f", distance))m"
         }
         updateTerrain(result.kind, confidence: result.confidence, detail: detail)
-        statusLabel.text = "LiDAR + 摄像头融合 · 约 9–10 次/秒"
+        statusLabel.text = "LiDAR + 摄像头融合 · 障碍检测 · 约 9–10 次/秒"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
+        let hazard = result.kind == .dropOff || result.kind == .obstacle
         let changed = result.kind != lastAnnouncedKind
-        let urgentRepeat = result.kind == .dropOff && now.timeIntervalSince(lastAnnouncementAt) >= 6
-        let periodicReminder = result.kind != .flat && now.timeIntervalSince(lastAnnouncementAt) >= 15
+        let urgentRepeat = hazard && now.timeIntervalSince(lastAnnouncementAt) >= (result.kind == .dropOff ? 6 : 4)
+        let periodicReminder = result.kind != .flat && !hazard && now.timeIntervalSince(lastAnnouncementAt) >= 15
         if changed || urgentRepeat || periodicReminder {
             if voiceSwitch.isOn {
-                speech.speak(result.announcement, urgent: result.kind == .dropOff)
+                speech.speak(result.announcement, urgent: hazard)
             }
-            if result.kind == .dropOff {
+            if hazard {
                 UINotificationFeedbackGenerator().notificationOccurred(.warning)
             }
             lastAnnouncedKind = result.kind
@@ -291,6 +447,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         case .unknown: terrainLabel.textColor = .systemGray
         case .flat: terrainLabel.textColor = .systemGreen
         case .uphill, .downhill, .stairsUp, .stairsDown: terrainLabel.textColor = .systemYellow
+        case .obstacle: terrainLabel.textColor = .systemOrange
         case .dropOff: terrainLabel.textColor = .systemRed
         }
     }
