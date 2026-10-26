@@ -66,7 +66,9 @@ jobs:
           xcodegen generate --spec project.yml
 
       - name: Build without code signing
+        id: build
         run: |
+          set -o pipefail
           xcodebuild \
             -project LidarTerrain.xcodeproj \
             -scheme LidarTerrain \
@@ -77,7 +79,22 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            build
+            build 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Publish build log
+        if: always()
+        run: |
+          mkdir -p dist
+          {
+            echo "outcome: ${{ steps.build.outcome }}"
+            echo "---- xcodebuild tail ----"
+            tail -n 150 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "(no log captured)"
+          } > dist/build-log.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f dist/build-log.txt
+          git commit -m "Build log [${{ steps.build.outcome }}]" || true
+          git push || true
 
       - name: Package unsigned IPA
         run: |
