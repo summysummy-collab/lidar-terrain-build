@@ -1,5 +1,6 @@
 import ARKit
 import CoreGraphics
+import Foundation
 import CoreVideo
 import simd
 
@@ -19,6 +20,14 @@ struct TerrainResult {
     let confidence: Float
     let debug: String
     let distance: Float?
+    /// Seconds this verdict has been continuously held by the stability gate.
+    /// A downstream actuator uses it to decide how hard it can commit.
+    var heldSeconds: Double = 0
+    /// The state the gate is currently converging on, if any. Lets a moving
+    /// platform start slowing down before the verdict actually flips.
+    var pendingKind: TerrainKind? = nil
+    /// 0...1 progress towards `pendingKind`.
+    var pendingProgress: Float = 0
 
     var announcement: String {
         switch kind {
@@ -93,7 +102,10 @@ final class DepthTerrainAnalyzer {
         lastStableKind == .stairsUp || lastStableKind == .stairsDown
     }
 
+    private let gate = TerrainStabilityGate()
+
     func reset() {
+        gate.reset()
         history.removeAll()
         lastStableKind = .unknown
         lastCameraBands = 0
@@ -116,13 +128,30 @@ final class DepthTerrainAnalyzer {
     }
 
     func unavailable(_ message: String) -> TerrainResult {
-        stabilize(TerrainResult(kind: .unknown, confidence: 0.1, debug: message, distance: nil))
+        gate.process(
+            stabilize(TerrainResult(kind: .unknown, confidence: 0.1, debug: message, distance: nil)),
+            at: ProcessInfo.processInfo.systemUptime
+        )
     }
 
+    /// Public entry point. Every verdict — including "no data at all" — passes
+    /// through the stability gate, so the caller only ever sees commands with a
+    /// dwell time attached rather than raw per-frame opinions.
     func analyze(
         frame: ARFrame,
         displayTransform: CGAffineTransform,
         motion: MotionSnapshot = .unavailable
+    ) -> TerrainResult? {
+        guard let raw = analyzeRaw(frame: frame, displayTransform: displayTransform, motion: motion) else {
+            return nil
+        }
+        return gate.process(raw, at: frame.timestamp)
+    }
+
+    private func analyzeRaw(
+        frame: ARFrame,
+        displayTransform: CGAffineTransform,
+        motion: MotionSnapshot
     ) -> TerrainResult? {
         updateMotion(frame: frame, motion: motion)
         guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }

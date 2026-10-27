@@ -427,8 +427,17 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         if let distance = result.distance {
             detail += " · 中位距离 \(String(format: "%.1f", distance))m"
         }
-        updateTerrain(result.kind, confidence: result.confidence, detail: detail)
-        statusLabel.text = "v5 · LiDAR + 运动融合 · 障碍 1.5m 内 · 9–10 次/秒"
+        if result.heldSeconds >= 0.05 {
+            detail += String(format: " · 已稳定 %.1fs", result.heldSeconds)
+        }
+        updateTerrain(
+            result.kind,
+            confidence: result.confidence,
+            detail: detail,
+            pending: result.pendingKind,
+            progress: result.pendingProgress
+        )
+        statusLabel.text = "v6 · 状态门控 · 障碍 1.5m 内 · 9–10 次/秒"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
@@ -456,9 +465,21 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         }
     }
 
-    private func updateTerrain(_ kind: TerrainKind, confidence: Float, detail: String) {
+    private func updateTerrain(
+        _ kind: TerrainKind,
+        confidence: Float,
+        detail: String,
+        pending: TerrainKind? = nil,
+        progress: Float = 0
+    ) {
         terrainLabel.text = kind.rawValue
-        evidenceLabel.text = kind == .unknown ? "证据不足时不强行判断方向" : "几何证据强度 \(Int(confidence * 100))%"
+        if let pending = pending {
+            evidenceLabel.text = "→ \(pending.rawValue) \(Int(progress * 100))% · 转换中，请减速"
+            evidenceLabel.textColor = .systemOrange
+        } else {
+            evidenceLabel.text = kind == .unknown ? "证据不足时不强行判断方向" : "几何证据强度 \(Int(confidence * 100))%"
+            evidenceLabel.textColor = .white
+        }
         detailLabel.text = detail
         switch kind {
         case .unknown: terrainLabel.textColor = .systemGray
@@ -474,7 +495,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             guard let self = self, self.running else { return }
             switch camera.trackingState {
             case .normal:
-                self.statusLabel.text = "v5 · LiDAR + 运动融合 · 跟踪正常"
+                self.statusLabel.text = "v6 · 状态门控 · 跟踪正常"
             case .notAvailable:
                 self.statusLabel.text = "空间跟踪不可用"
             case .limited:
