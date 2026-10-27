@@ -1,4 +1,5 @@
 name: Build unsigned iOS IPA
+# retrigger: 2026-10-28 (previous run hung on runner allocation)
 
 on:
   workflow_dispatch:
