@@ -63,7 +63,14 @@ final class TerrainStabilityGate {
         }
 
         let held = time - settledAt
-        let required = requiredSeconds(from: settled, to: candidate, evidence: input.confidence) + patience
+        // Entering or leaving the flat state is the routine move of every walk:
+        // a step up, a kerb, the end of a flight. It is not a threshold flip,
+        // so it only pays half the oscillation penalty. Charging full price
+        // here is what made "平路 → 上楼梯" drag after any earlier wobble, and
+        // the penalty then stayed latched for the rest of the walk.
+        let routine = settled == .flat || candidate == .flat
+        let penalty = routine ? patience * 0.5 : patience
+        let required = requiredSeconds(from: settled, to: candidate, evidence: input.confidence) + penalty
         // Even a well-evidenced flip waits until the current state has had its
         // minimum airtime, so the platform never gets two commands in a row.
         let dwellWait = max(0, minimumDwell(settled) - held)
@@ -89,8 +96,13 @@ final class TerrainStabilityGate {
         // threshold. Make the next attempt cost more instead of echoing it.
         // Capped so a genuinely changing surface recovers quickly: a person
         // turning round twice on a wide landing is not a sensor fault.
+        //
+        // Flat-in / flat-out transitions accrue at half rate, because that is
+        // the ordinary boundary of every flight of stairs. A single wobble at
+        // a stair mouth used to tax every later transition for seconds.
+        let routine = (kind == .flat) != (previous == .flat)
         if lastFlipFrom == kind && lastFlipTo == previous && time - lastFlipAt < 3.0 {
-            patience = min(1.5, patience + 0.8)
+            patience = min(1.5, patience + (routine ? 0.4 : 0.8))
         } else {
             patience = max(0, patience - 0.6)
         }
@@ -157,20 +169,25 @@ final class TerrainStabilityGate {
             return 1.25
         }
         if isStair(from) != isStair(to) {
-            // Stairs vs ramp: same height change, different gait.
-            return 0.55
+            // Stairs vs ramp: same direction, same act, slightly different
+            // gait. Was 0.55 s; together with the flat leg that made a
+            // "平路 → 上坡 → 上楼梯" chain cost the best part of a second.
+            return 0.28
         }
         if to == .flat || from == .flat {
-            return 0.60
+            // Half of the old 0.60 s. Entering and leaving a flight is the most
+            // frequent transition of a walk and also the easiest to see: the
+            // profile goes from a clean plane to discrete levels, or back.
+            return 0.30
         }
-        return 0.45
+        return 0.30
     }
 
     private func minimumDwell(_ kind: TerrainKind) -> TimeInterval {
         switch kind {
-        case .stairsUp, .stairsDown: return 0.55
-        case .uphill, .downhill: return 0.45
-        case .flat: return 0.35
+        case .stairsUp, .stairsDown: return 0.30
+        case .uphill, .downhill: return 0.25
+        case .flat: return 0.25
         case .obstacle: return 0.30
         case .dropOff, .unknown: return 0
         }
