@@ -435,9 +435,11 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             confidence: result.confidence,
             detail: detail,
             pending: result.pendingKind,
-            progress: result.pendingProgress
+            progress: result.pendingProgress,
+            stepHeight: result.stepHeight,
+            treadCount: result.treadCount
         )
-        statusLabel.text = "v6 · 状态门控 · 障碍 1.5m 内 · 9–10 次/秒"
+        statusLabel.text = "v7 · 楼梯分类 + 台阶高度 · 障碍 0.5m 内"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
@@ -470,12 +472,17 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         confidence: Float,
         detail: String,
         pending: TerrainKind? = nil,
-        progress: Float = 0
+        progress: Float = 0,
+        stepHeight: Float? = nil,
+        treadCount: Int = 0
     ) {
         terrainLabel.text = kind.rawValue
         if let pending = pending {
             evidenceLabel.text = "→ \(pending.rawValue) \(Int(progress * 100))% · 转换中，请减速"
             evidenceLabel.textColor = .systemOrange
+        } else if let step = stepHeight, kind == .stairsUp || kind == .stairsDown {
+            evidenceLabel.text = "台阶高 \(Int((step * 100).rounded()))cm · 可见 \(treadCount) 级 · 证据 \(Int(confidence * 100))%"
+            evidenceLabel.textColor = .white
         } else {
             evidenceLabel.text = kind == .unknown ? "证据不足时不强行判断方向" : "几何证据强度 \(Int(confidence * 100))%"
             evidenceLabel.textColor = .white
@@ -495,7 +502,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             guard let self = self, self.running else { return }
             switch camera.trackingState {
             case .normal:
-                self.statusLabel.text = "v6 · 状态门控 · 跟踪正常"
+                self.statusLabel.text = "v7 · 楼梯分类 · 跟踪正常"
             case .notAvailable:
                 self.statusLabel.text = "空间跟踪不可用"
             case .limited:

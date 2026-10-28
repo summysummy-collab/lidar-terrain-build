@@ -117,7 +117,9 @@ final class TerrainStabilityGate {
             distance: input.distance,
             heldSeconds: held,
             pendingKind: pending,
-            pendingProgress: progress
+            pendingProgress: progress,
+            stepHeight: input.stepHeight,
+            treadCount: input.treadCount
         )
     }
 

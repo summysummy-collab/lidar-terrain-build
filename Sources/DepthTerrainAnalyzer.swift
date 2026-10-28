@@ -28,6 +28,10 @@ struct TerrainResult {
     var pendingKind: TerrainKind? = nil
     /// 0...1 progress towards `pendingKind`.
     var pendingProgress: Float = 0
+    /// Measured height of a single step, when a staircase was recognised.
+    var stepHeight: Float? = nil
+    /// How many treads the probe could see at once.
+    var treadCount: Int = 0
 
     var announcement: String {
         switch kind {
@@ -35,11 +39,15 @@ struct TerrainResult {
         case .flat: return "前方平路"
         case .uphill: return "前方上坡"
         case .downhill: return "前方下坡，注意脚下"
-        case .stairsUp: return "前方上楼梯，注意台阶"
-        case .stairsDown: return "前方下楼梯，注意台阶"
+        case .stairsUp, .stairsDown:
+            let direction = kind == .stairsUp ? "上" : "下"
+            if let step = stepHeight {
+                return "前方\(direction)楼梯，台阶高约 \(Int((step * 100).rounded())) 厘米"
+            }
+            return "前方\(direction)楼梯，注意台阶"
         case .obstacle:
             guard let distance = distance else { return "注意，前方有障碍" }
-            let rounded = min(1.5, max(0.3, distance))
+            let rounded = min(0.5, max(0.15, distance))
             return "注意，正前方 \(String(format: "%.1f", rounded)) 米有障碍，请停下"
         case .dropOff: return "注意，前方深度断层，请停止前行"
         }
@@ -76,6 +84,10 @@ final class DepthTerrainAnalyzer {
     /// flip up/down on its own, only repeated strict geometry can.
     private var stairDirection: Float = 0
     private var reversalVotes = 0
+    /// Last measured riser height, kept so a one-frame dropout mid-flight does
+    /// not blank the step size on screen.
+    private var lastStepHeight: Float?
+    private var lastTreadCount = 0
 
     // MARK: - Fused motion (accelerometer + gyroscope + barometer)
 
@@ -116,6 +128,8 @@ final class DepthTerrainAnalyzer {
         obstacleConfirmed = false
         stairDirection = 0
         reversalVotes = 0
+        lastStepHeight = nil
+        lastTreadCount = 0
         motionTrail.removeAll()
         motionSlope = 0
         motionSlopeValid = false
@@ -187,8 +201,11 @@ final class DepthTerrainAnalyzer {
             CVPixelBufferGetBytesPerRow($0) / MemoryLayout<UInt8>.stride
         } ?? 0
 
-        let columns = 7
-        let rows = 9
+        // Denser than v6 on purpose: the step-height probe needs enough points
+        // per tread to see discrete levels in a height histogram, and more
+        // samples per bin also removes the "样本不足" verdicts.
+        let columns = 9
+        let rows = 13
         let imageWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
         let imageHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
         let intrinsics = frame.camera.intrinsics
@@ -280,12 +297,12 @@ final class DepthTerrainAnalyzer {
                 obstacleConfirmed = false
             }
         }
-        if obstacleConfirmed, let obstacle = obstacleDistance, obstacle <= 1.5 {
+        if obstacleConfirmed, let obstacle = obstacleDistance, obstacle <= 0.50 {
             degradedFrames = 0
             return TerrainResult(
                 kind: .obstacle,
-                confidence: min(0.95, 0.62 + (1.5 - min(1.5, obstacle)) * 0.18),
-                debug: "1.5m 内竖直面障碍 \(String(format: "%.1f", obstacle))m · \(obstacleDetail)",
+                confidence: min(0.95, 0.62 + (0.50 - min(0.50, obstacle)) * 0.36),
+                debug: "0.5m 内竖直面障碍 \(String(format: "%.1f", obstacle))m · \(obstacleDetail)",
                 distance: obstacle
             )
         }
@@ -342,71 +359,102 @@ final class DepthTerrainAnalyzer {
         // trustworthy as evidence; cap the confidence in that case.
         let thinProfile = profileBins.count < 3
         let distance = median(samples.map { $0.depth })
-        let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount) · 区段 \(profileBins.count)/\(bins.count)"
+
+        // Two questions that used to be tangled together are now answered in
+        // order:
+        //   * WHAT is ahead  -> staircase geometry (discrete levels) vs ramp
+        //                       (continuous heights)
+        //   * WHICH WAY      -> the sign of the slope, later cross-checked
+        //                       against the barometer
+        // That is why a ramp with a few paving joints no longer reads as a
+        // staircase, and a real flight seen at a shallow angle no longer reads
+        // as a ramp.
+        let stairProfile = StairGeometryProbe.measure(
+            points: samples.map { TerrainPoint(forward: $0.forward, height: $0.height) }
+        )
+        let treads = stairProfile.treadCount
+        let angle = abs(degrees)
+        // Levels spread continuously through the height range and nothing
+        // discrete to stand on: a ramp wearing a staircase costume. Veto the
+        // stair branches instead of trusting how jagged the fitted line is.
+        //
+        // Only applies to shallow angles. Real ramps are built at 5–12° (an
+        // accessible ramp is 1:12, the steepest car-park ramp is about 8.5°); a
+        // 30° incline is essentially always a staircase, so a probe that failed
+        // to resolve its treads must not demote it to a ramp.
+        let rampLike = angle < 22
+            && !stairProfile.isLikelyStairs
+            && stairProfile.discreteness < 0.42
+            && treads <= 2
+        let steepLikeStairs = angle >= 22 && angle <= 50
+        // A smooth monotone incline with no horizontal level anywhere is a ramp
+        // even while the previous verdict was a staircase. Without this escape
+        // hatch `onStairs` would latch onto a long slope entered from a flight.
+        let strongSlopeEscape = treads <= 1 && residual <= 0.10
+            && monotonic >= 0.60 && angle >= 5
+
+        let strongStair = stairProfile.isLikelyStairs
+            || (jumps >= 2 && residual >= 0.05 && monotonic >= 0.55
+                && angle >= 7 && angle <= 50 && !rampLike)
+            || (steepLikeStairs && (jumps >= 1 || lastCameraBands >= 1 || treads >= 2))
+        let weakStair = !rampLike && angle >= 4 && angle <= 50
+            && ((lastCameraBands >= 2 && jumps >= 1 && residual >= 0.04 && monotonic >= 0.45)
+                || (onStairs && !strongSlopeEscape))
+        let slopeEvidence = angle >= 3.5 && angle <= 30
+            && residual <= 0.13 && monotonic >= 0.48
+
+        let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount) · \(stairProfile.debug)"
 
         let raw: TerrainResult?
-        if abs(degrees) <= 5.0 && residual <= 0.14 {
+        if angle <= 4.5 && residual <= 0.12 && !stairProfile.isLikelyStairs {
             raw = TerrainResult(
                 kind: .flat,
                 confidence: thinProfile ? min(evidence, 0.55) : evidence,
                 debug: debug,
                 distance: distance
             )
-        } else {
-            // Full geometric stair evidence (strict, as before).
-            let stairEvidence = residual >= 0.05 && jumps >= 2 && abs(degrees) >= 8 && abs(degrees) <= 45 && monotonic >= 0.60
-            // Continuation: once on stairs, a much weaker profile keeps the state
-            // so mid-stair frames stop reporting "unknown".
-            let stairContinue = onStairs && residual >= 0.04 && jumps >= 1
-                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
-            // Camera fusion: stacked tread edges in the live image can confirm
-            // stairs when the depth profile alone is borderline.
-            let stairCamera = lastCameraBands >= 2 && residual >= 0.04 && jumps >= 1
-                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.45
-            // Loosest tier: a single visible tread band plus any depth break.
-            let stairLoose = lastCameraBands >= 1 && residual >= 0.04 && jumps >= 1
-                && abs(degrees) >= 5 && abs(degrees) <= 45 && monotonic >= 0.50
-            let slopeEvidence = residual <= 0.13 && abs(degrees) >= 4.5 && abs(degrees) <= 35 && monotonic >= 0.50
-            if stairEvidence || stairContinue || stairCamera || stairLoose {
-                let measuredSign: Float = slope > 0 ? 1 : -1
-                if stairEvidence {
-                    if stairDirection == 0 {
+        } else if strongStair || weakStair {
+            let measuredSign: Float = slope > 0 ? 1 : -1
+            if strongStair {
+                if stairDirection == 0 {
+                    stairDirection = measuredSign
+                    reversalVotes = 0
+                } else if measuredSign != stairDirection {
+                    // Only strong evidence may reverse, and a clearly measured
+                    // steep opposite slope counts double so that turning round
+                    // on a landing is not delayed by a whole second.
+                    reversalVotes += angle >= 14 ? 2 : 1
+                    if reversalVotes >= 6 {
                         stairDirection = measuredSign
                         reversalVotes = 0
-                    } else if measuredSign != stairDirection {
-                        // Six consecutive strict frames (~0.6s) are needed to
-                        // reverse a latched direction; noise cannot do it.
-                        // A clearly measured steep opposite slope counts double.
-                        reversalVotes += abs(degrees) >= 14 ? 2 : 1
-                        if reversalVotes >= 6 {
-                            stairDirection = measuredSign
-                            reversalVotes = 0
-                        }
-                    } else {
-                        reversalVotes = 0
                     }
+                } else {
+                    reversalVotes = 0
                 }
-                // Continuation / camera-only evidence keeps the current
-                // direction instead of being allowed to flip it.
-                let announcedSign = stairDirection == 0 ? measuredSign : stairDirection
-                let cameraBonus = 0.02 * Float(min(4, lastCameraBands))
-                let continueBonus: Float = (stairContinue || stairLoose) && !stairEvidence ? 0.02 : 0
-                raw = TerrainResult(
-                    kind: announcedSign > 0 ? .stairsUp : .stairsDown,
-                    confidence: min(0.94, evidence + 0.08 + cameraBonus + continueBonus),
-                    debug: debug + " · 视觉台阶边 \(lastCameraBands) 组",
-                    distance: distance
-                )
-            } else if slopeEvidence {
-                raw = TerrainResult(
-                    kind: slope > 0 ? .uphill : .downhill,
-                    confidence: thinProfile ? min(evidence, 0.55) : evidence,
-                    debug: debug,
-                    distance: distance
-                )
-            } else {
-                raw = nil
             }
+            // Continuation / camera-only evidence may hold the current heading
+            // but never flip it.
+            let announcedSign = stairDirection == 0 ? measuredSign : stairDirection
+            let cameraBonus = 0.02 * Float(min(4, lastCameraBands))
+            let stepBonus = stairProfile.isLikelyStairs ? 0.10 * stairProfile.confidence : 0
+            let weakBonus: Float = strongStair ? 0 : 0.02
+            raw = TerrainResult(
+                kind: announcedSign > 0 ? .stairsUp : .stairsDown,
+                confidence: min(0.95, evidence + 0.10 + stepBonus + cameraBonus + weakBonus),
+                debug: debug + " · 视觉台阶边 \(lastCameraBands) 组",
+                distance: distance,
+                stepHeight: stairProfile.stepHeight,
+                treadCount: treads
+            )
+        } else if slopeEvidence {
+            raw = TerrainResult(
+                kind: slope > 0 ? .uphill : .downhill,
+                confidence: thinProfile ? min(evidence, 0.55) : evidence,
+                debug: debug,
+                distance: distance
+            )
+        } else {
+            raw = nil
         }
 
         let fused = fuseMotion(raw: raw, timestamp: frame.timestamp, distance: distance)
@@ -419,6 +467,10 @@ final class DepthTerrainAnalyzer {
         guard let fused = fused else {
             return held("剖面混杂，暂无可判定的路面结构 · " + motionNote, confidence: 0.30, distance: distance)
         }
+        if let step = fused.stepHeight {
+            lastStepHeight = step
+            lastTreadCount = fused.treadCount
+        }
         degradedFrames = 0
         return stabilize(fused)
     }
@@ -430,11 +482,14 @@ final class DepthTerrainAnalyzer {
         let previous = lastStableKind
         let canHold = previous != .unknown && previous != .dropOff && previous != .obstacle
         if canHold && degradedFrames <= 12 {
+            let onFlight = previous == .stairsUp || previous == .stairsDown
             return stabilize(TerrainResult(
                 kind: previous,
                 confidence: max(0.45, confidence),
                 debug: reason + " · 延续上一判定",
-                distance: distance
+                distance: distance,
+                stepHeight: onFlight ? lastStepHeight : nil,
+                treadCount: onFlight ? lastTreadCount : 0
             ))
         }
         return stabilize(TerrainResult(kind: .unknown, confidence: max(0.15, confidence), debug: reason, distance: distance))
@@ -719,14 +774,13 @@ final class DepthTerrainAnalyzer {
 
         let rowCount = 15
         let columnCount = 7
-        // Only obstacles inside 1.5 m are announced. Beyond that the corridor
-        // walls, doorways and furniture of every normal room would keep the
-        // alarm ringing, and at that range the user is not about to collide
-        // with it yet. The last bin ends exactly at 1.50 m, so nothing past
-        // the limit can produce a verdict.
-        let binWidth: Float = 0.15
-        let firstDistance: Float = 0.30
-        let limitDistance: Float = 1.50
+        // Only obstacles inside 0.5 m are announced. Anything further away is
+        // ordinary room geometry — corridor walls, door frames, furniture —
+        // and at that range it is not yet something to stop for. The last bin
+        // ends exactly at the limit, so nothing beyond it can produce a verdict.
+        let binWidth: Float = 0.06
+        let firstDistance: Float = 0.20
+        let limitDistance: Float = 0.50
         let binCount = Int(((limitDistance - firstDistance) / binWidth).rounded())
         var binForward = Array(repeating: [Float](), count: binCount)
         var binHeight = Array(repeating: [Float](), count: binCount)
@@ -760,23 +814,23 @@ final class DepthTerrainAnalyzer {
         for index in 0..<binCount {
             let heights = binHeight[index]
             // A wall is seen by several pixels across at least two columns; a
-            // speckle or a single railing bar is not enough. The support bar is
-            // lower than before because a 0.15 m slice at 1.4 m only holds a
-            // handful of samples.
-            guard heights.count >= 5, binColumns[index].nonzeroBitCount >= 2 else { continue }
+            // speckle or a single railing bar is not enough. A 6 cm slice this
+            // close holds plenty of samples when something really is there.
+            guard heights.count >= 6, binColumns[index].nonzeroBitCount >= 2 else { continue }
             let sorted = heights.sorted()
             let lowIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.10))
             let highIndex = min(sorted.count - 1, Int(Float(sorted.count) * 0.90))
             let span = sorted[highIndex] - sorted[lowIndex]
-            guard span >= 0.40 else { continue }
+            guard span >= 0.30 else { continue }
             guard let distance = median(binForward[index]) else { continue }
 
             if onStairs {
-                // On stairs only genuinely tall obstructions are worth
-                // interrupting for; risers (about 0.17 m) and the stairwell
-                // wall must not turn into constant obstacle alarms.
-                guard distance >= 0.9, span >= 0.60 else { continue }
-            } else if lastCameraBands >= 2 && span < 0.80 {
+                // The riser of the very next step is a vertical surface 17 cm
+                // tall sitting right where the sensor is looking. Demand a
+                // taller face so stair treads never turn into obstacle alarms,
+                // and never suppress a genuinely blocking object.
+                guard span >= 0.38 else { continue }
+            } else if lastCameraBands >= 2 && span < 0.45 {
                 // Many visible tread edges plus a modest height spread reads
                 // as a staircase, not as an obstacle.
                 continue
@@ -899,14 +953,23 @@ final class DepthTerrainAnalyzer {
             // While waiting for confirmation, keep showing the last stable
             // verdict rather than the placeholder.
             let shown: TerrainKind = lastStableKind == .unknown ? .unknown : lastStableKind
-            return TerrainResult(kind: shown, confidence: meanConfidence, debug: raw.debug + " · 正在确认", distance: raw.distance)
+            return TerrainResult(
+                kind: shown,
+                confidence: meanConfidence,
+                debug: raw.debug + " · 正在确认",
+                distance: raw.distance,
+                stepHeight: raw.stepHeight,
+                treadCount: raw.treadCount
+            )
         }
         lastStableKind = candidate
         return TerrainResult(
             kind: candidate,
             confidence: meanConfidence,
             debug: raw.debug + " · 稳定 \(count) 帧",
-            distance: raw.distance
+            distance: raw.distance,
+            stepHeight: raw.stepHeight,
+            treadCount: raw.treadCount
         )
     }
 }
