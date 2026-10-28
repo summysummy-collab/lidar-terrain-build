@@ -439,7 +439,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             stepHeight: result.stepHeight,
             treadCount: result.treadCount
         )
-        statusLabel.text = "v7 · 楼梯分类 + 台阶高度 · 障碍 0.5m 内"
+        statusLabel.text = "v8 · 方向快速切换 · 障碍 0.5m 内"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
@@ -502,7 +502,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             guard let self = self, self.running else { return }
             switch camera.trackingState {
             case .normal:
-                self.statusLabel.text = "v7 · 楼梯分类 · 跟踪正常"
+                self.statusLabel.text = "v8 · 方向快速切换 · 跟踪正常"
             case .notAvailable:
                 self.statusLabel.text = "空间跟踪不可用"
             case .limited:

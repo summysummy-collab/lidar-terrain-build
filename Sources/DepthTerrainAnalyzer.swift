@@ -405,6 +405,16 @@ final class DepthTerrainAnalyzer {
 
         let debug = "坡度 \(String(format: "%.1f", degrees))° · 跳变 \(jumps) · 残差 \(String(format: "%.2f", residual))m · 样本 \(validCount) · \(stairProfile.debug)"
 
+        // A landing flattens the profile almost completely. Dropping the latch
+        // here means the first frame that sees the new direction is adopted at
+        // once, instead of having to out-vote a heading measured before the
+        // turn. Without this the old direction survives the entire landing and
+        // the reversal only starts counting at the second flight.
+        if angle < 3.0 && residual <= 0.10 {
+            stairDirection = 0
+            reversalVotes = 0
+        }
+
         let raw: TerrainResult?
         if angle <= 4.5 && residual <= 0.12 && !stairProfile.isLikelyStairs {
             raw = TerrainResult(
@@ -420,11 +430,14 @@ final class DepthTerrainAnalyzer {
                     stairDirection = measuredSign
                     reversalVotes = 0
                 } else if measuredSign != stairDirection {
-                    // Only strong evidence may reverse, and a clearly measured
-                    // steep opposite slope counts double so that turning round
-                    // on a landing is not delayed by a whole second.
+                    // Only strong evidence may reverse. Three votes, with a
+                    // steeply measured opposite slope counting double, so a
+                    // turn on a landing is adopted in two frames (~0.2 s)
+                    // instead of six. The old six-vote bar assumed noise was
+                    // the main risk, but by the time strong evidence repeats
+                    // three times the surface really has changed.
                     reversalVotes += angle >= 14 ? 2 : 1
-                    if reversalVotes >= 6 {
+                    if reversalVotes >= 3 {
                         stairDirection = measuredSign
                         reversalVotes = 0
                     }
@@ -481,7 +494,7 @@ final class DepthTerrainAnalyzer {
         degradedFrames += 1
         let previous = lastStableKind
         let canHold = previous != .unknown && previous != .dropOff && previous != .obstacle
-        if canHold && degradedFrames <= 12 {
+        if canHold && degradedFrames <= 8 {
             let onFlight = previous == .stairsUp || previous == .stairsDown
             return stabilize(TerrainResult(
                 kind: previous,
@@ -633,9 +646,30 @@ final class DepthTerrainAnalyzer {
             return raw
         }
 
+        // Safety states pass straight through. A latched direction must never
+        // be allowed to inherit them — silently turning an obstacle into a
+        // "上坡" is exactly the kind of conversion that gets someone hurt.
+        if let raw = raw {
+            if raw.kind == .obstacle || raw.kind == .dropOff { return raw }
+            // A flat reading means the surface levelled out, e.g. a landing.
+            // Holding the old heading here is what made reversals feel late.
+            if raw.kind == .flat && motionSlopeStreak < 8 { return raw }
+        }
+
         // A latched correction keeps winning while the barometer still agrees,
         // so a stubborn depth profile cannot pull the verdict back and forth.
         if motionOverrideSign == sign && timestamp <= motionOverrideUntil {
+            // ...unless the camera now clearly points the other way. The
+            // barometer averages the last ~3 s, so immediately after a turn it
+            // still reports the old direction; a strong visual reversal is
+            // fresher and has to win, otherwise the latch suppresses the whole
+            // reversal until it expires.
+            if let raw = raw, visualSign(of: raw) == -sign, raw.confidence >= 0.80 {
+                motionOverrideSign = 0
+                motionOverrideUntil = 0
+                motionConflictFrames = 0
+                return raw
+            }
             stairDirection = sign
             reversalVotes = 0
             let base = raw
@@ -643,18 +677,14 @@ final class DepthTerrainAnalyzer {
                 kind: directionKind(from: base, sign: sign),
                 confidence: max(0.52, min(0.78, base?.confidence ?? 0.52)),
                 debug: (base?.debug ?? "视觉剖面无结论") + " · 运动主导 \(Int(strength))°",
-                distance: base?.distance ?? distance
+                distance: base?.distance ?? distance,
+                stepHeight: base?.stepHeight,
+                treadCount: base?.treadCount ?? 0
             )
         }
 
         if let candidate = raw {
-            let visualSign: Float
-            switch candidate.kind {
-            case .stairsUp, .uphill: visualSign = 1
-            case .stairsDown, .downhill: visualSign = -1
-            case .flat: visualSign = 0
-            default: return candidate
-            }
+            let visualSign = self.visualSign(of: candidate)
 
             if visualSign == sign {
                 motionConflictFrames = 0
@@ -663,7 +693,9 @@ final class DepthTerrainAnalyzer {
                     kind: candidate.kind,
                     confidence: min(0.95, candidate.confidence + 0.06),
                     debug: candidate.debug + " · " + motionNote + " 一致",
-                    distance: candidate.distance
+                    distance: candidate.distance,
+                    stepHeight: candidate.stepHeight,
+                    treadCount: candidate.treadCount
                 )
             }
 
@@ -671,7 +703,7 @@ final class DepthTerrainAnalyzer {
                 // Flat profile, yet the phone keeps climbing or descending.
                 if motionSlopeStreak >= 8 {
                     motionOverrideSign = sign
-                    motionOverrideUntil = timestamp + 5.0
+                    motionOverrideUntil = timestamp + 2.0
                     return TerrainResult(
                         kind: directionKind(from: candidate, sign: sign),
                         confidence: 0.55,
@@ -685,18 +717,24 @@ final class DepthTerrainAnalyzer {
             // Direct conflict. Keep the geometry verdict for a moment, but if
             // the barometer keeps insisting, it wins: it is measuring the
             // actual body movement, not a wall 4 m away.
+            //
+            // Except when the camera is very sure. A confident visual reading
+            // is fresh, while the barometer lags by its averaging window, so
+            // right after a turn it must not be overruled.
             motionConflictFrames += 1
-            if motionConflictFrames >= 8 {
+            if motionConflictFrames >= 8, candidate.confidence < 0.85 {
                 motionConflictFrames = 0
                 motionOverrideSign = sign
-                motionOverrideUntil = timestamp + 5.0
+                motionOverrideUntil = timestamp + 2.0
                 stairDirection = sign
                 reversalVotes = 0
                 return TerrainResult(
                     kind: directionKind(from: candidate, sign: sign),
                     confidence: max(0.55, min(0.80, candidate.confidence - 0.05)),
                     debug: candidate.debug + " · 运动纠正 \(Int(strength))°（原判 \(candidate.kind.rawValue)）",
-                    distance: candidate.distance
+                    distance: candidate.distance,
+                    stepHeight: candidate.stepHeight,
+                    treadCount: candidate.treadCount
                 )
             }
             return candidate
@@ -706,7 +744,7 @@ final class DepthTerrainAnalyzer {
         // saying out loud instead of leaving the user at "路况待确认".
         if motionSlopeStreak >= 8 {
             motionOverrideSign = sign
-            motionOverrideUntil = timestamp + 4.0
+            motionOverrideUntil = timestamp + 2.0
             return TerrainResult(
                 kind: directionKind(from: nil, sign: sign),
                 confidence: 0.52,
@@ -715,6 +753,16 @@ final class DepthTerrainAnalyzer {
             )
         }
         return nil
+    }
+
+    /// +1 climbing, -1 descending, 0 when the verdict carries no direction.
+    private func visualSign(of result: TerrainResult?) -> Float {
+        guard let result = result else { return 0 }
+        switch result.kind {
+        case .stairsUp, .uphill: return 1
+        case .stairsDown, .downhill: return -1
+        default: return 0
+        }
     }
 
     /// Theil-Sen fit followed by one trimming pass. Walls, doors and railings
@@ -922,8 +970,8 @@ final class DepthTerrainAnalyzer {
     private func stabilize(_ raw: TerrainResult) -> TerrainResult {
         history.append(raw)
         if history.count > 8 { history.removeFirst() }
-        let clearWindow = history.suffix(9)
-        if clearWindow.count == 9 && clearWindow.allSatisfy({ $0.kind == .unknown }) {
+        let clearWindow = history.suffix(8)
+        if clearWindow.count == 8 && clearWindow.allSatisfy({ $0.kind == .unknown }) {
             lastStableKind = .unknown
             return TerrainResult(
                 kind: .unknown,
@@ -943,13 +991,15 @@ final class DepthTerrainAnalyzer {
               let count = counts[candidate] else { return raw }
         let totalWeight = weights.values.reduce(0, +)
         let share = (weights[candidate] ?? 0) / max(totalWeight, 0.001)
-        let reversingStairs = (lastStableKind == .stairsUp && candidate == .stairsDown) ||
-            (lastStableKind == .stairsDown && candidate == .stairsUp)
-        let requiredCount = reversingStairs ? 5 : (candidate == .dropOff ? 2 : 3)
+        // A reversal used to need five frames *on top of* the gate's 1.6 s and
+        // the direction latch's six votes, which stacked into two and a half
+        // seconds. The gate is now the single place that prices a reversal, so
+        // this layer only needs a bare majority.
+        let requiredCount = candidate == .dropOff ? 2 : 3
         let candidateResults = window.filter { $0.kind == candidate }
         let meanConfidence = candidateResults.reduce(Float(0)) { $0 + $1.confidence } / Float(max(1, candidateResults.count))
 
-        guard count >= requiredCount, share >= 0.50, meanConfidence >= 0.40 else {
+        guard count >= requiredCount, share >= 0.45, meanConfidence >= 0.40 else {
             // While waiting for confirmation, keep showing the last stable
             // verdict rather than the placeholder.
             let shown: TerrainKind = lastStableKind == .unknown ? .unknown : lastStableKind
