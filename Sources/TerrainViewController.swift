@@ -437,9 +437,10 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             pending: result.pendingKind,
             progress: result.pendingProgress,
             stepHeight: result.stepHeight,
-            treadCount: result.treadCount
+            treadCount: result.treadCount,
+            tallStep: result.tallStep
         )
-        statusLabel.text = "v8 · 方向快速切换 · 障碍 0.5m 内"
+        statusLabel.text = "v9 · 高台阶判障碍 · 障碍 0.5m 内"
 
         guard result.kind != .unknown, result.confidence >= 0.45 else { return }
         let now = Date()
@@ -474,12 +475,16 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         pending: TerrainKind? = nil,
         progress: Float = 0,
         stepHeight: Float? = nil,
-        treadCount: Int = 0
+        treadCount: Int = 0,
+        tallStep: Float? = nil
     ) {
         terrainLabel.text = kind.rawValue
         if let pending = pending {
             evidenceLabel.text = "→ \(pending.rawValue) \(Int(progress * 100))% · 转换中，请减速"
             evidenceLabel.textColor = .systemOrange
+        } else if let riser = tallStep, kind == .obstacle {
+            evidenceLabel.text = "台阶超高 \(Int((riser * 100).rounded()))cm · 超过 30cm 上限 · 无法通行"
+            evidenceLabel.textColor = .systemRed
         } else if let step = stepHeight, kind == .stairsUp || kind == .stairsDown {
             evidenceLabel.text = "台阶高 \(Int((step * 100).rounded()))cm · 可见 \(treadCount) 级 · 证据 \(Int(confidence * 100))%"
             evidenceLabel.textColor = .white
@@ -492,7 +497,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
         case .unknown: terrainLabel.textColor = .systemGray
         case .flat: terrainLabel.textColor = .systemGreen
         case .uphill, .downhill, .stairsUp, .stairsDown: terrainLabel.textColor = .systemYellow
-        case .obstacle: terrainLabel.textColor = .systemOrange
+        case .obstacle: terrainLabel.textColor = tallStep == nil ? .systemOrange : .systemRed
         case .dropOff: terrainLabel.textColor = .systemRed
         }
     }
@@ -502,7 +507,7 @@ final class TerrainViewController: UIViewController, ARSessionDelegate {
             guard let self = self, self.running else { return }
             switch camera.trackingState {
             case .normal:
-                self.statusLabel.text = "v8 · 方向快速切换 · 跟踪正常"
+                self.statusLabel.text = "v9 · 高台阶判障碍 · 跟踪正常"
             case .notAvailable:
                 self.statusLabel.text = "空间跟踪不可用"
             case .limited:

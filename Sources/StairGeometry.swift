@@ -32,6 +32,9 @@ struct StairProfile {
     let discreteness: Float
     /// True when the levels are evenly spaced by a plausible riser height.
     let isLikelyStairs: Bool
+    /// True when the measured riser is too tall to climb. Such a step-up is
+    /// reported as an obstacle instead of a staircase.
+    let isTallStep: Bool
     /// 0...1 confidence in the staircase classification.
     let confidence: Float
     /// Compact summary for the on-screen diagnostics.
@@ -42,6 +45,7 @@ struct StairProfile {
         treadCount: 0,
         discreteness: 0,
         isLikelyStairs: false,
+        isTallStep: false,
         confidence: 0,
         debug: "阶梯测量 无样本"
     )
@@ -54,7 +58,15 @@ enum StairGeometryProbe {
     private static let maxForward: Float = 3.20
     private static let minimumPoints = 24
     private static let minimumRiser: Float = 0.07
-    private static let maximumRiser: Float = 0.35
+    /// Upper bound of what still counts as one riser rather than a wall. Kept
+    /// well above the stair limit so a 40 cm kerb is *measured* and can be
+    /// reported as too tall, instead of vanishing from the histogram.
+    private static let maximumRiser: Float = 0.60
+    /// A riser above this cannot be climbed; it is a step-up barrier.
+    static let tallRiserLimit: Float = 0.30
+    /// Normal stair risers are 15–20 cm; a step is accepted up to the limit.
+    private static let maximumStairRiser: Float = tallRiserLimit
+    private static let minimumStairRiser: Float = 0.10
     /// Half-width of the "this point lies on a tread" window.
     private static let treadTolerance: Float = 0.04
     /// Tread levels closer than this are the same tread seen with noise.
@@ -96,6 +108,7 @@ enum StairGeometryProbe {
                 treadCount: 0,
                 discreteness: 0,
                 isLikelyStairs: false,
+                isTallStep: false,
                 confidence: 0,
                 debug: "阶梯测量 无离散水平面"
             )
@@ -132,6 +145,7 @@ enum StairGeometryProbe {
                 treadCount: levels.count,
                 discreteness: discreteness,
                 isLikelyStairs: false,
+                isTallStep: false,
                 confidence: min(0.40, 0.20 + 0.20 * discreteness),
                 debug: String(format: "阶梯测量 %d 个水平面 · 离散 %.0f%%", levels.count, discreteness * 100)
             )
@@ -141,23 +155,34 @@ enum StairGeometryProbe {
         // happened to produce two peaks will not repeat the spacing.
         let consistent = gaps.filter { abs($0 - stepHeight) <= 0.045 }.count
         let regularity = Float(consistent) / Float(gaps.count)
-        let plausible = stepHeight >= 0.10 && stepHeight <= 0.28
+        let plausible = stepHeight >= minimumStairRiser && stepHeight <= maximumStairRiser
+        // A riser past the climbable limit turns the flight into a step-up
+        // barrier. It needs a stricter discreteness bar than a normal stair:
+        // two unrelated peaks on a ramp can also leave a 35 cm gap, and that
+        // must not be mistaken for a kerb.
+        let isTallStep = stepHeight > maximumStairRiser
+            && levels.count >= 2
+            && discreteness >= 0.50
+            && regularity >= 0.50
         let isStairs = levels.count >= 2 && plausible
             && regularity >= 0.55 && discreteness >= 0.45
-        let confidence = isStairs
+        let confidence = isStairs || isTallStep
             ? min(0.95, 0.45 + 0.30 * regularity
                   + 0.05 * Float(min(4, levels.count - 1))
                   + 0.20 * discreteness)
             : min(0.50, 0.25 + 0.25 * discreteness)
         let debug = String(
-            format: "阶梯 %d 级 · 高 %.0fcm · 规整 %.0f%% · 离散 %.0f%%",
-            levels.count, stepHeight * 100, regularity * 100, discreteness * 100
+            format: "阶梯 %d 级 · 高 %.0fcm%@ · 规整 %.0f%% · 离散 %.0f%%",
+            levels.count, stepHeight * 100,
+            isTallStep ? " 超高" : "",
+            regularity * 100, discreteness * 100
         )
         return StairProfile(
-            stepHeight: plausible ? stepHeight : nil,
+            stepHeight: stepHeight,
             treadCount: levels.count,
             discreteness: discreteness,
             isLikelyStairs: isStairs,
+            isTallStep: isTallStep,
             confidence: confidence,
             debug: debug
         )

@@ -32,6 +32,9 @@ struct TerrainResult {
     var stepHeight: Float? = nil
     /// How many treads the probe could see at once.
     var treadCount: Int = 0
+    /// Set when the obstacle is a riser too tall to climb, so the announcement
+    /// can say "台阶过高" instead of the generic wall warning.
+    var tallStep: Float? = nil
 
     var announcement: String {
         switch kind {
@@ -46,6 +49,13 @@ struct TerrainResult {
             }
             return "前方\(direction)楼梯，注意台阶"
         case .obstacle:
+            if let riser = tallStep {
+                let centimetres = Int((riser * 100).rounded())
+                if let distance = distance {
+                    return "注意，正前方 \(String(format: "%.1f", distance)) 米有 \(centimetres) 厘米高台阶，无法通行，请停下"
+                }
+                return "注意，前方有 \(centimetres) 厘米高台阶，无法通行，请停下"
+            }
             guard let distance = distance else { return "注意，前方有障碍" }
             let rounded = min(0.5, max(0.15, distance))
             return "注意，正前方 \(String(format: "%.1f", rounded)) 米有障碍，请停下"
@@ -88,6 +98,10 @@ final class DepthTerrainAnalyzer {
     /// not blank the step size on screen.
     private var lastStepHeight: Float?
     private var lastTreadCount = 0
+    /// Consecutive frames where the probe measured a riser taller than the
+    /// climbable limit. Two frames keep a single mis-measured pair of treads
+    /// from stopping the platform on a normal flight.
+    private var tallStepStreak = 0
 
     // MARK: - Fused motion (accelerometer + gyroscope + barometer)
 
@@ -130,6 +144,7 @@ final class DepthTerrainAnalyzer {
         reversalVotes = 0
         lastStepHeight = nil
         lastTreadCount = 0
+        tallStepStreak = 0
         motionTrail.removeAll()
         motionSlope = 0
         motionSlopeValid = false
@@ -415,8 +430,37 @@ final class DepthTerrainAnalyzer {
             reversalVotes = 0
         }
 
+        // A riser taller than the climbable limit is not a staircase, it is a
+        // step-up barrier: the platform cannot mount it. This has to be judged
+        // before the flat branch, because standing level in front of a raised
+        // kerb, a stair-top landing or a high platform yields an almost flat
+        // fitted slope — it used to read as "平路" right up to the collision.
+        let tallRiser = stairProfile.isTallStep ? stairProfile.stepHeight : nil
+        tallStepStreak = tallRiser == nil ? 0 : tallStepStreak + 1
+        let frontier = riserFrontier(profileBins)
+        let tallStepBarrier: TerrainResult? = {
+            guard let riser = tallRiser else { return nil }
+            // On a flight the probe occasionally merges two normal treads into
+            // one tall gap, so require a longer run there than on open ground.
+            let requiredStreak = onStairs ? 4 : 2
+            guard tallStepStreak >= requiredStreak else { return nil }
+            // The surface must really break, and the break must be near enough
+            // to act on. A raised platform 2.5 m away is not a collision yet.
+            guard let frontier = frontier, frontier.jump >= 0.15, frontier.distance <= 2.2 else { return nil }
+            return TerrainResult(
+                kind: .obstacle,
+                confidence: min(0.93, 0.54 + 0.40 * stairProfile.confidence),
+                debug: "台阶超高 \(Int((riser * 100).rounded()))cm · 前沿 \(String(format: "%.1f", frontier.distance))m · \(stairProfile.debug)",
+                distance: frontier.distance,
+                treadCount: treads,
+                tallStep: riser
+            )
+        }()
+
         let raw: TerrainResult?
-        if angle <= 4.5 && residual <= 0.12 && !stairProfile.isLikelyStairs {
+        if let barrier = tallStepBarrier {
+            raw = barrier
+        } else if angle <= 4.5 && residual <= 0.12 && !stairProfile.isLikelyStairs {
             raw = TerrainResult(
                 kind: .flat,
                 confidence: thinProfile ? min(evidence, 0.55) : evidence,
@@ -513,6 +557,22 @@ final class DepthTerrainAnalyzer {
         let intercept: Float
         let residual: Float
         let bins: [Bin]
+    }
+
+    /// Where the walking surface steps up: the adjacent bin pair with the
+    /// largest height jump, and how far away its near side is.
+    private func riserFrontier(_ bins: [Bin]) -> (jump: Float, distance: Float)? {
+        var bestJump: Float = 0
+        var bestDistance: Float?
+        for (near, far) in zip(bins, bins.dropFirst()) {
+            let jump = abs(far.height - near.height)
+            if jump > bestJump {
+                bestJump = jump
+                bestDistance = near.distance
+            }
+        }
+        guard let distance = bestDistance else { return nil }
+        return (jump: bestJump, distance: distance)
     }
 
     // MARK: - Fused motion
@@ -1009,7 +1069,8 @@ final class DepthTerrainAnalyzer {
                 debug: raw.debug + " · 正在确认",
                 distance: raw.distance,
                 stepHeight: raw.stepHeight,
-                treadCount: raw.treadCount
+                treadCount: raw.treadCount,
+                tallStep: shown == .obstacle ? raw.tallStep : nil
             )
         }
         lastStableKind = candidate
@@ -1019,7 +1080,8 @@ final class DepthTerrainAnalyzer {
             debug: raw.debug + " · 稳定 \(count) 帧",
             distance: raw.distance,
             stepHeight: raw.stepHeight,
-            treadCount: raw.treadCount
+            treadCount: raw.treadCount,
+            tallStep: candidate == .obstacle ? raw.tallStep : nil
         )
     }
 }

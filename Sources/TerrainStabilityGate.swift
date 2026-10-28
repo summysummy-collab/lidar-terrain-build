@@ -123,7 +123,8 @@ final class TerrainStabilityGate {
             pendingKind: pending,
             pendingProgress: progress,
             stepHeight: input.stepHeight,
-            treadCount: input.treadCount
+            treadCount: input.treadCount,
+            tallStep: settled == .obstacle ? input.tallStep : nil
         )
     }
 
